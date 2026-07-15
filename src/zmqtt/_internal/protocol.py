@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Final, Literal, cast
 
 from zmqtt._internal.packets.auth import Auth
@@ -107,6 +107,26 @@ def _segment_rank(seg: str) -> int:
 def _filter_specificity(actual_filter: str) -> tuple[int, ...]:
     """Return a sort key for a filter (shared prefix already stripped); lexicographically smaller == more specific."""
     return tuple(_segment_rank(s) for s in actual_filter.split("/"))
+
+
+def _one_per_queue(
+    entries: Iterable[tuple[str, SubscriptionEntry]],
+) -> list[tuple[str, SubscriptionEntry]]:
+    """Collapse per-filter entries down to one per underlying queue.
+
+    A multi-filter subscribe() call is ONE subscription: one queue, one
+    subscription identifier, N filter entries in the session table. A broker
+    PUBLISH must reach that queue exactly once — once per filter would hand the
+    application N duplicates of every message.
+    """
+    seen: set[int] = set()
+    unique: list[tuple[str, SubscriptionEntry]] = []
+    for filter_, entry in entries:
+        if id(entry.queue) in seen:
+            continue
+        seen.add(id(entry.queue))
+        unique.append((filter_, entry))
+    return unique
 
 
 def _raise_on_rejected_filters(filters: list[SubscriptionRequest], suback: SubAck) -> None:
@@ -614,10 +634,13 @@ class MQTTProtocol:
 
         # MQTT 5: the broker names the subscription that matched — exact where the
         # filter-specificity guess below cannot tell overlapping filters apart
-        # (e.g. a $share subscription and its plain twin).
+        # (e.g. a $share subscription and its plain twin). A multi-filter
+        # subscribe() registers one entry PER FILTER, all with this identifier and
+        # one shared queue — the application must see the PUBLISH once per
+        # subscription, not once per filter it happens to carry.
         echoed = publish.properties.subscription_identifier if publish.properties else None
         if echoed is not None:
-            identified = [(f, e) for f, e in snapshot if e.subscription_identifier == echoed]
+            identified = _one_per_queue((f, e) for f, e in snapshot if e.subscription_identifier == echoed)
             if identified:
                 await self._put_message(publish, identified, ack_callback)
                 return
