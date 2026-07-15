@@ -8,14 +8,17 @@ import asyncio
 import contextlib
 import logging
 from collections import deque
+from typing import Literal
 
 import pytest
 
 from zmqtt._internal.packets.codec import encode
 from zmqtt._internal.packets.connect import ConnAck, Connect
 from zmqtt._internal.packets.disconnect import Disconnect
+from zmqtt._internal.packets.properties import PublishProperties
 from zmqtt._internal.packets.publish import PubAck, Publish
-from zmqtt._internal.packets.subscribe import SubAck, SubscriptionRequest
+from zmqtt._internal.packets.reader import PacketBuffer
+from zmqtt._internal.packets.subscribe import SubAck, Subscribe, SubscriptionRequest
 from zmqtt._internal.protocol import (
     _DEFAULT_STRIPPED_PREFIXES,
     MQTTProtocol,
@@ -68,6 +71,7 @@ def make_protocol(
     keepalive: int = 60,
     ping_timeout: float = 5.0,
     stripped_prefixes: tuple[str, ...] = _DEFAULT_STRIPPED_PREFIXES,
+    version: Literal["3.1.1", "5.0"] = "3.1.1",
 ) -> tuple[MQTTProtocol, FakeTransport]:
     transport = FakeTransport()
     state = SessionState()
@@ -77,6 +81,7 @@ def make_protocol(
         keepalive=keepalive,
         ping_timeout=ping_timeout,
         stripped_prefixes=stripped_prefixes,
+        version=version,
     )
     return protocol, transport
 
@@ -158,7 +163,6 @@ async def test_deliver_no_match_logs_warning(caplog: pytest.LogCaptureFixture) -
     assert "unknown/topic" in caplog.text
 
 
-<<<<<<< HEAD
 async def test_stripped_prefix_filter_receives_messages() -> None:
     """A group-less decorator ($queue, $exclusive, ...) is stripped for matching.
 
@@ -229,6 +233,35 @@ async def test_configured_prefix_reaches_subscribe() -> None:
     assert protocol._state.subscriptions["$q/sensors/+/state"].actual_filter == "sensors/+/state"
 
 
+async def test_protocol_queue_is_bounded() -> None:
+    """The per-filter delivery queue must honour queue_maxsize.
+
+    Unbounded, a slow consumer grows it without limit — no drop, no block, no
+    TCP backpressure, just memory (18 999 of 20 000 flood messages in practice).
+    """
+    protocol, transport = make_protocol()
+
+    async def subscribe() -> dict[str, asyncio.Queue[Message]]:
+        _, queues = await protocol.subscribe(
+            [SubscriptionRequest(topic_filter="flood/#", qos=QoS.AT_MOST_ONCE)],
+            queue_maxsize=5,
+        )
+        return queues
+
+    task = asyncio.create_task(subscribe())
+    await asyncio.sleep(0)
+    suback = encode(SubAck(packet_id=1, return_codes=(0x00,)), version="3.1.1")
+    transport.feed(suback)
+    read = asyncio.create_task(protocol._read_loop())
+    queues = await task
+    read.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await read
+
+    (queue,) = queues.values()
+    assert queue.maxsize == 5
+
+
 def test_suback_failure_codes_raise() -> None:
     """A rejected filter (SUBACK >= 0x80, e.g. an ACL denial) must not look successful."""
     filters = [
@@ -282,6 +315,72 @@ async def test_dead_protocol_refuses_new_operations() -> None:
         await protocol.subscribe(
             [SubscriptionRequest(topic_filter="a/b", qos=QoS.AT_MOST_ONCE)],
         )
+
+
+async def test_subscription_identifier_routes_delivery() -> None:
+    """The broker's echoed identifier picks the exact subscription that matched.
+
+    Two overlapping filters — a $share subscription and its plain twin — normalise
+    to the same actual filter, so filter matching alone cannot tell them apart:
+    one used to receive everything (both broker copies) and the other starved.
+    """
+    protocol, _ = make_protocol()
+    shared = SubscriptionEntry(
+        queue=asyncio.Queue(),
+        actual_filter="demo/+/state",
+        subscription_identifier=1,
+    )
+    plain = SubscriptionEntry(
+        queue=asyncio.Queue(),
+        actual_filter="demo/+/state",
+        subscription_identifier=2,
+    )
+    protocol._state.subscriptions["$share/g/demo/+/state"] = shared
+    protocol._state.subscriptions["demo/+/state"] = plain
+
+    for echoed, entry in ((1, shared), (2, plain)):
+        await protocol._deliver(
+            Publish(
+                topic="demo/dev-1/state",
+                payload=b"x",
+                qos=QoS.AT_MOST_ONCE,
+                retain=False,
+                dup=False,
+                properties=PublishProperties(subscription_identifier=echoed),
+            ),
+            ack_callback=None,
+        )
+        assert entry.queue.qsize() == 1
+
+    assert shared.queue.qsize() == 1
+    assert plain.queue.qsize() == 1
+
+
+async def test_subscribe_sends_identifier_in_properties() -> None:
+    """The identifier must actually go out on the wire in the SUBSCRIBE packet."""
+    protocol, transport = make_protocol(version="5.0")
+
+    async def subscribe() -> None:
+        await protocol.subscribe(
+            [SubscriptionRequest(topic_filter="a/b", qos=QoS.AT_LEAST_ONCE)],
+            subscription_identifier=7,
+        )
+
+    task = asyncio.create_task(subscribe())
+    await asyncio.sleep(0)
+    transport.feed(encode(SubAck(packet_id=1, return_codes=(0x01,)), version="5.0"))
+    read = asyncio.create_task(protocol._read_loop())
+    await task
+    read.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await read
+
+    buf = PacketBuffer(version="5.0")
+    buf.feed(transport.sent[0])
+    (packet,) = list(buf)
+    assert isinstance(packet, Subscribe)
+    assert packet.properties is not None
+    assert packet.properties.subscription_identifier == 7
 
 
 async def test_inbound_qos2_manual_ack_duplicate_ignored() -> None:
