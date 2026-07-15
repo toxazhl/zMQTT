@@ -18,12 +18,13 @@ from zmqtt._internal.packets.subscribe import SubAck, SubscriptionRequest
 from zmqtt._internal.protocol import (
     _DEFAULT_STRIPPED_PREFIXES,
     MQTTProtocol,
+    _raise_on_rejected_filters,
     _shared_filter_to_actual,
 )
 from zmqtt._internal.state import SessionState, SubscriptionEntry
 from zmqtt._internal.types.message import Message
 from zmqtt._internal.types.qos import QoS
-from zmqtt.errors import MQTTConnectError, MQTTProtocolError, MQTTTimeoutError
+from zmqtt.errors import MQTTConnectError, MQTTProtocolError, MQTTSubscribeError, MQTTTimeoutError
 
 
 class FakeTransport:
@@ -218,6 +219,27 @@ async def test_configured_prefix_reaches_subscribe() -> None:
         await read
 
     assert protocol._state.subscriptions["$q/sensors/+/state"].actual_filter == "sensors/+/state"
+
+
+def test_suback_failure_codes_raise() -> None:
+    """A rejected filter (SUBACK >= 0x80, e.g. an ACL denial) must not look successful."""
+    filters = [
+        SubscriptionRequest(topic_filter="allowed/topic", qos=QoS.AT_LEAST_ONCE),
+        SubscriptionRequest(topic_filter="$SYS/#", qos=QoS.AT_LEAST_ONCE),
+    ]
+    suback = SubAck(packet_id=1, return_codes=(0x01, 0x80))
+
+    with pytest.raises(MQTTSubscribeError) as exc_info:
+        _raise_on_rejected_filters(filters, suback)
+
+    assert exc_info.value.failures == {"$SYS/#": 0x80}
+
+
+def test_suback_granted_codes_pass() -> None:
+    filters = [SubscriptionRequest(topic_filter="a/b", qos=QoS.EXACTLY_ONCE)]
+    suback = SubAck(packet_id=1, return_codes=(0x02,))
+
+    _raise_on_rejected_filters(filters, suback)  # no raise
 
 
 async def test_inbound_qos2_manual_ack_duplicate_ignored() -> None:
