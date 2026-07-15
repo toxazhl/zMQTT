@@ -357,19 +357,23 @@ async def test_subscription_identifier_routes_delivery() -> None:
 
 
 async def test_multi_filter_subscription_delivers_once_per_publish() -> None:
-    """One subscribe() with MANY filters is ONE subscription: N per-filter entries
-    share one queue and one identifier. A broker PUBLISH echoing that identifier
-    used to be enqueued once PER FILTER — 20 filters meant 20 duplicates of every
-    message (found live: a device ack recorded 20 times per command)."""
+    """One subscribe() with MANY filters is ONE subscription: one identifier, one
+    per-filter entry (each with its own relay queue, all draining into the same
+    application queue). A broker PUBLISH echoing that identifier used to be
+    enqueued once PER ENTRY — 20 filters meant 20 duplicates of every message
+    (found live: a device ack recorded 20 times per command). It must land in
+    exactly ONE entry: the one whose filter matches the topic."""
     protocol, _ = make_protocol()
-    queue: asyncio.Queue[Message] = asyncio.Queue()
-    filters = [f"demo/+/server/{name}" for name in ("state", "status", "ota", "state/ack")]
+    filters = ["demo/+/server/state", "demo/+/server/status", "demo/+/server/state/ack"]
+    entries = {}
     for topic_filter in filters:
-        protocol._state.subscriptions[f"$share/g/{topic_filter}"] = SubscriptionEntry(
-            queue=queue,
+        entry = SubscriptionEntry(
+            queue=asyncio.Queue(),
             actual_filter=topic_filter,
             subscription_identifier=1,
         )
+        entries[topic_filter] = entry
+        protocol._state.subscriptions[f"$share/g/{topic_filter}"] = entry
 
     await protocol._deliver(
         Publish(
@@ -382,7 +386,9 @@ async def test_multi_filter_subscription_delivers_once_per_publish() -> None:
         ),
         ack_callback=None,
     )
-    assert queue.qsize() == 1  # once per subscription, not once per filter
+    sizes = {f: e.queue.qsize() for f, e in entries.items()}
+    assert sum(sizes.values()) == 1  # once per subscription, not once per filter
+    assert sizes["demo/+/server/state/ack"] == 1  # and via the filter that matched
 
 
 async def test_subscribe_sends_identifier_in_properties() -> None:

@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable
 from typing import Final, Literal, cast
 
 from zmqtt._internal.packets.auth import Auth
@@ -109,24 +109,20 @@ def _filter_specificity(actual_filter: str) -> tuple[int, ...]:
     return tuple(_segment_rank(s) for s in actual_filter.split("/"))
 
 
-def _one_per_queue(
-    entries: Iterable[tuple[str, SubscriptionEntry]],
-) -> list[tuple[str, SubscriptionEntry]]:
-    """Collapse per-filter entries down to one per underlying queue.
+def _pick_recipient(entries: list[tuple[str, SubscriptionEntry]], topic: str) -> list[tuple[str, SubscriptionEntry]]:
+    """One recipient per broker PUBLISH within an identified subscription.
 
-    A multi-filter subscribe() call is ONE subscription: one queue, one
-    subscription identifier, N filter entries in the session table. A broker
-    PUBLISH must reach that queue exactly once — once per filter would hand the
-    application N duplicates of every message.
+    A multi-filter subscribe() call is ONE subscription: one identifier, one
+    per-filter entry (each with its own relay queue) in the session table.
+    The broker sends one PUBLISH per subscription — delivering it to every
+    entry sharing the identifier would hand the application one duplicate per
+    filter. Prefer the most specific entry whose filter matches the topic; if
+    none matches (a normalisation edge), fall back to the first entry rather
+    than dropping the message.
     """
-    seen: set[int] = set()
-    unique: list[tuple[str, SubscriptionEntry]] = []
-    for filter_, entry in entries:
-        if id(entry.queue) in seen:
-            continue
-        seen.add(id(entry.queue))
-        unique.append((filter_, entry))
-    return unique
+    matching = [(f, e) for f, e in entries if _topic_matches(e.actual_filter, topic)]
+    pool = matching or entries
+    return [min(pool, key=lambda fe: _filter_specificity(fe[1].actual_filter))]
 
 
 def _raise_on_rejected_filters(filters: list[SubscriptionRequest], suback: SubAck) -> None:
@@ -634,15 +630,15 @@ class MQTTProtocol:
 
         # MQTT 5: the broker names the subscription that matched — exact where the
         # filter-specificity guess below cannot tell overlapping filters apart
-        # (e.g. a $share subscription and its plain twin). A multi-filter
-        # subscribe() registers one entry PER FILTER, all with this identifier and
-        # one shared queue — the application must see the PUBLISH once per
-        # subscription, not once per filter it happens to carry.
+        # (e.g. a $share subscription and its plain twin). Within the identified
+        # subscription, route to the entry whose filter matches the topic — one
+        # PUBLISH, one delivery, never once per filter.
         echoed = publish.properties.subscription_identifier if publish.properties else None
         if echoed is not None:
-            identified = _one_per_queue((f, e) for f, e in snapshot if e.subscription_identifier == echoed)
+            identified = [(f, e) for f, e in snapshot if e.subscription_identifier == echoed]
             if identified:
-                await self._put_message(publish, identified, ack_callback)
+                recipients = _pick_recipient(identified, publish.topic)
+                await self._put_message(publish, recipients, ack_callback)
                 return
             log.warning(
                 "No subscription with identifier %r for topic %r, falling back to filter matching",
