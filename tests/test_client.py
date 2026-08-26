@@ -6,7 +6,7 @@ from collections import deque
 
 import pytest
 
-from zmqtt import MQTTClient, MQTTTimeoutError, ReconnectConfig, create_client
+from zmqtt import MQTTClient, MQTTDisconnectedError, MQTTTimeoutError, ReconnectConfig, create_client
 from zmqtt._internal.packets.codec import encode
 from zmqtt._internal.packets.connect import ConnAck
 from zmqtt._internal.transport.base import Transport
@@ -96,3 +96,49 @@ async def test_mqtt_connect_timeout_gives_up_after_max_attempts() -> None:
 
     assert len(made) == 1  # gave up after the single allowed attempt
     assert made[0].closed  # transport still cleaned up on give-up
+
+
+async def test_reset_forces_reconnect_and_resubscribe() -> None:
+    """reset() drops the socket; the run loop rebuilds session + subscriptions."""
+    connack = encode(ConnAck(session_present=False, return_code=0), version="3.1.1")
+
+    class EofOnCloseTransport(FakeTransport):
+        """read() raises once close() was called — like a real dead socket."""
+
+        async def read(self, n: int) -> bytes:  # noqa: ARG002
+            while not self._rx:
+                if self.closed:
+                    msg = "Connection lost"
+                    raise MQTTDisconnectedError(msg)
+                await asyncio.sleep(0)
+            return self._rx.popleft()
+
+    made: list[EofOnCloseTransport] = []
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        transport = EofOnCloseTransport(feed=connack)
+        made.append(transport)
+        return transport
+
+    client = MQTTClient(
+        "localhost",
+        reconnect=ReconnectConfig(initial_delay=0.0, max_attempts=None),
+        transport_factory=factory,
+    )
+    async with client:
+        first = client._protocol
+        assert len(made) == 1
+
+        await client.reset()
+
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(made) == 2 and client._protocol is not None and client._protocol is not first:
+                break
+        else:
+            pytest.fail("run loop did not rebuild the connection after reset()")
+
+        assert made[0].closed  # the old socket was force-dropped
+        assert client._protocol._transport is made[1]  # and a fresh session took over
+
+    await client.reset()  # after disconnect: a documented no-op, must not raise

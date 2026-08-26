@@ -109,6 +109,8 @@ class MQTTClientV311(Protocol):
 
     async def ping(self, timeout: float = 10.0) -> float: ...
 
+    async def reset(self) -> None: ...
+
 
 class MQTTClientV5(Protocol):
     """Type-safe view of MQTTClient for MQTT 5.0 connections."""
@@ -143,6 +145,8 @@ class MQTTClientV5(Protocol):
     async def auth(self, method: str, data: bytes | None = None) -> None: ...
 
     async def ping(self, timeout: float = 10.0) -> float: ...
+
+    async def reset(self) -> None: ...
 
     async def request(
         self,
@@ -483,6 +487,25 @@ class MQTTClient:
             msg = "Not connected"
             raise MQTTDisconnectedError(msg)
         return await self._protocol.ping(timeout=timeout)
+
+    async def reset(self) -> None:
+        """Force-drop the connection and let the run loop rebuild it.
+
+        For the connected-but-deaf pathology: the broker still answers PING but a
+        session-level fault (e.g. an exhausted QoS 1 receive window) means no
+        message will ever be delivered again, so no error surfaces on its own.
+        Closing the socket makes the read loop raise, which the run loop treats
+        as an ordinary connection loss: reconnect (fresh broker-side session for
+        clean-start clients — the stuck inflight window dies with the old one)
+        and transparent re-subscription of every active subscription.
+
+        Safe to call at any time; a no-op when the client never connected or the
+        reconnect cycle is already in flight.
+        """
+        if self._protocol is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._protocol._transport.close()  # same idiom as _run_loop
 
     def subscribe(
         self,
