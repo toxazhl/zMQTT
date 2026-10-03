@@ -24,7 +24,32 @@ async for msg in sub:
 await sub.stop()
 ```
 
-`stop()` sends UNSUBSCRIBE and releases internal resources. It is safe to call even if the connection has already been lost.
+`stop()` sends UNSUBSCRIBE, stops message delivery and returns the broker's UNSUBACK as an `UnsubscribeResult`, or `None` if none was received — for example after the connection was lost. It never raises: failures and rejections are logged as warnings. Exiting `async with` does the same and discards the result.
+
+For graceful shutdown of a persistent session, use `await sub.detach()` before
+`await client.disconnect()`. This stops local delivery without sending
+UNSUBSCRIBE, so the broker keeps the filter and can queue QoS 1/2 messages while
+the client is offline. `detach()` discards messages still waiting in the local
+subscription queue. With `auto_ack=False`, those messages and any newly received
+after detachment remain unacknowledged; messages already handed to a handler can
+still be acknowledged before disconnect. With `auto_ack=True`, a queued message
+may already have been acknowledged, so use manual acknowledgement when replay of
+unprocessed messages is required. Automatic reconnection preserves detachment
+until an explicit `client.disconnect()`, including leaving new messages
+unacknowledged. A detached `Subscription` is terminal; explicitly disconnect
+and connect the client before creating a new subscription. Subscribing to a
+detached filter before that disconnect logs a warning and does not restore
+delivery. Cancel tasks already waiting in `get_message()`
+during shutdown. To remove the broker filter, use `stop()` instead.
+
+On MQTT 5.0 the broker may reject some filters (reason code `0x80` or above); they are listed in `failures`. The subscription stops anyway, but the broker may keep sending messages on a rejected filter — on a persistent session, across reconnects too.
+
+```python
+result = await sub.stop()
+if result is not None:
+    for topic_filter, reason_code in result.failures.items():
+        print(f"{topic_filter!r} rejected: 0x{reason_code:02X}")
+```
 
 ### Buffering and backpressure
 

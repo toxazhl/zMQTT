@@ -28,6 +28,7 @@
       members:
         - start
         - stop
+        - detach
         - get_message
         - __aenter__
         - __aexit__
@@ -44,6 +45,14 @@
         - retain
         - properties
         - ack
+
+::: zmqtt.ConnectionInfo
+    options:
+      show_source: false
+
+::: zmqtt.UnsubscribeResult
+    options:
+      show_source: false
 
 ## Configuration
 
@@ -74,6 +83,14 @@
 ## Properties (MQTT 5.0)
 
 ::: zmqtt.PublishProperties
+    options:
+      show_source: false
+
+::: zmqtt.ConnAckProperties
+    options:
+      show_source: false
+
+::: zmqtt.UnsubAckProperties
     options:
       show_source: false
 
@@ -112,6 +129,10 @@
       show_source: false
 
 ::: zmqtt.MQTTSubscribeError
+    options:
+      show_source: false
+
+::: zmqtt.MQTTPublishError
     options:
       show_source: false
 

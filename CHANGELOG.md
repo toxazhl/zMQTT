@@ -2,6 +2,106 @@
 
 <!-- version list -->
 
+## v0.2.4 (2026-09-28)
+
+### Bug Fixes
+
+- Stop wait_for from hiding cancellation on Python 3.10 and 3.11
+  ([#111](https://github.com/faststream-community/zMQTT/pull/111),
+  [`aea9ac9`](https://github.com/faststream-community/zMQTT/commit/aea9ac96e38b4b9bfa15d866b74b8b1100e9a502))
+
+### Features
+
+- **client**: Expose MQTT 5 CONNECT properties
+  ([#109](https://github.com/faststream-community/zMQTT/pull/109),
+  [`895429d`](https://github.com/faststream-community/zMQTT/commit/895429d07c38c04034ddb77d02e289c1828a9e00))
+
+### Testing
+
+- **artemis**: Xfail flaky persistent session replay test
+  ([#106](https://github.com/faststream-community/zMQTT/pull/106),
+  [`e6536fe`](https://github.com/faststream-community/zMQTT/commit/e6536fe7f94250154b0faab067a66997100230ac))
+
+
+## v0.2.3 (2026-09-22)
+
+### Bug Fixes
+
+- **transport**: Recover from socket errors and bound close
+  ([#103](https://github.com/faststream-community/zMQTT/pull/103),
+  [`0522de7`](https://github.com/faststream-community/zMQTT/commit/0522de7f9486e8b8e3ff7036f01b3d2ea92bf7eb))
+
+### Continuous Integration
+
+- **deps**: Bump astral-sh/setup-uv from 10.0.1 to 10.1.0 in the github-actions group
+  ([#102](https://github.com/faststream-community/zMQTT/pull/102),
+  [`49d1579`](https://github.com/faststream-community/zMQTT/commit/49d1579a258dd213a55ecef251ef2991be623b1f))
+
+### Features
+
+- **client**: Honor the server's Maximum QoS
+  ([#98](https://github.com/faststream-community/zMQTT/pull/98),
+  [`911e326`](https://github.com/faststream-community/zMQTT/commit/911e32662c30c59c7698e57cf6c783923705500d))
+
+- **client**: Report rejected UNSUBACK from Subscription.stop()
+  ([#100](https://github.com/faststream-community/zMQTT/pull/100),
+  [`1b77201`](https://github.com/faststream-community/zMQTT/commit/1b77201f59667d76f8dd2971956e130c7750f370))
+
+### Performance Improvements
+
+- **reader**: Stop copying the buffer once per packet
+  ([#101](https://github.com/faststream-community/zMQTT/pull/101),
+  [`b0ba5e2`](https://github.com/faststream-community/zMQTT/commit/b0ba5e271867d29ef6babffe21ab7764197b158c))
+
+
+## v0.2.2 (2026-09-08)
+
+### Bug Fixes
+
+- "Tests" badge ([#71](https://github.com/faststream-community/zMQTT/pull/71),
+  [`dc9b459`](https://github.com/faststream-community/zMQTT/commit/dc9b459244478a36ec9fa14b06ce4607abc297eb))
+
+### Chores
+
+- Update README badges ([#69](https://github.com/faststream-community/zMQTT/pull/69),
+  [`2c1bf3c`](https://github.com/faststream-community/zMQTT/commit/2c1bf3c9e0b4b75949bcc8ece64eedbfd1fb082a))
+
+### Continuous Integration
+
+- **deps**: Bump the github-actions group with 2 updates
+  ([#94](https://github.com/faststream-community/zMQTT/pull/94),
+  [`9c4001a`](https://github.com/faststream-community/zMQTT/commit/9c4001acdd1571beac8ea97975151db258b8d302))
+
+- **deps**: Bump the github-actions group with 2 updates
+  ([#70](https://github.com/faststream-community/zMQTT/pull/70),
+  [`3341b00`](https://github.com/faststream-community/zMQTT/commit/3341b0033ce7671a0630b3e9078ec2b03a0a9fd3))
+
+### Features
+
+- **client**: Expose MQTT connection information
+  ([#92](https://github.com/faststream-community/zMQTT/pull/92),
+  [`a6daf60`](https://github.com/faststream-community/zMQTT/commit/a6daf60a1c5dab8cfb7cb6886199dfd6c1fbf978))
+
+
+## v0.2.1 (2026-08-30)
+
+### Bug Fixes
+
+- **publish**: Raise MQTTPublishError on negative PUBACK/PUBREC reason codes.
+  ([#67](https://github.com/faststream-community/zMQTT/pull/67),
+  [`3aa3498`](https://github.com/faststream-community/zMQTT/commit/3aa349877b8c78ef128b5a921f4a84479a82e37d))
+
+### Chores
+
+- **tests**: Add htmlcov badge ([#64](https://github.com/faststream-community/zMQTT/pull/64),
+  [`636dc6a`](https://github.com/faststream-community/zMQTT/commit/636dc6afa0974a6f296ce6b1eedfa7de21733f1a))
+
+### Documentation
+
+- Placed docs link to readme header ([#66](https://github.com/faststream-community/zMQTT/pull/66),
+  [`f937323`](https://github.com/faststream-community/zMQTT/commit/f937323687cf1872cdf3a88782e300ff4e4b4379))
+
+
 ## v0.2.0 (2026-08-25)
 
 ### Bug Fixes

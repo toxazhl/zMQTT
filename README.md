@@ -1,17 +1,37 @@
+<div align="center">
+
 # zmqtt
 
-[![PyPI version](https://img.shields.io/pypi/v/zmqtt.svg)](https://pypi.org/project/zmqtt/)
-[![PyPI Downloads](https://static.pepy.tech/personalized-badge/zmqtt?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/zmqtt)
-[![Tests](https://github.com/faststream-community/zMQTT/actions/workflows/tests.yaml/badge.svg?branch=master)](https://github.com/faststream-community/zMQTT/actions/workflows/tests.yaml)
+[![PyPI version](https://shieldcn.dev/badge/dynamic/json.svg?url=https%3A%2F%2Fpypi.org%2Fpypi%2Fzmqtt%2Fjson&query=%24.info.version&variant=branded&size=xs&mode=light&logo=python&label=pypi+version)](https://pypi.org/project/zmqtt) 
+[![PyPI downloads](https://shieldcn.dev/pypi/dm/zmqtt.svg?variant=branded&size=xs&logo=python&logoColor=ffffff)](https://pypistats.org/packages/zmqtt) 
+[![PyPI requires python](https://shieldcn.dev/badge/dynamic/json.svg?url=https%3A%2F%2Fpypi.org%2Fpypi%2Fzmqtt%2Fjson&query=%24.info.requires_python&size=xs&mode=light&logo=python&logoColor=ffffff&label=requires+python&color=3775A9)](https://pypi.org/project/zmqtt)
+
+<a href="https://github.com/faststream-community/zMQTT/actions/workflows/tests.yaml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/faststream-community/zMQTT.svg?workflow=tests.yaml&branch=master&variant=outline&font=geist&size=xs&animate=pulse&mode=dark&label=Tests"><img alt="Tests" src="https://shieldcn.dev/github/ci/faststream-community/zMQTT.svg?workflow=tests.yaml&branch=master&variant=outline&font=geist&size=xs&animate=pulse&mode=light&label=Tests"></picture></a>
+<a href="https://github.com/faststream-community/zMQTT/blob/master/LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/faststream-community/zMQTT/license.svg?variant=outline&font=geist&size=xs&mode=dark"><img alt="License" src="https://shieldcn.dev/github/faststream-community/zMQTT/license.svg?variant=outline&font=geist&size=xs&mode=light"></picture></a>
+<a href="https://t.me/rumqtt"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/dynamic/json.svg?url=https%3A%2F%2Ftg.chirizxc.workers.dev%2Frumqtt&query=%24.members&suffix=+members&variant=outline&font=geist&size=xs&mode=dark&logo=telegram&logoColor=24A1DE&label=t.me/rumqtt"><img alt="Telegram members" src="https://shieldcn.dev/badge/dynamic/json.svg?url=https%3A%2F%2Ftg.chirizxc.workers.dev%2Frumqtt&query=%24.members&suffix=+members&variant=outline&font=geist&size=xs&mode=light&logo=telegram&logoColor=24A1DE&label=t.me/rumqtt"></picture></a>
+<a href="https://t.me/python_faststream"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/dynamic/json.svg?url=https%3A%2F%2Ftg.chirizxc.workers.dev%2Fpython_faststream&query=%24.members&suffix=+members&variant=outline&font=geist&size=xs&mode=dark&logo=telegram&logoColor=24A1DE&label=t.me/python_faststream"><img alt="Telegram members" src="https://shieldcn.dev/badge/dynamic/json.svg?url=https%3A%2F%2Ftg.chirizxc.workers.dev%2Fpython_faststream&query=%24.members&suffix=+members&variant=outline&font=geist&size=xs&mode=light&logo=telegram&logoColor=24A1DE&label=t.me/python_faststream"></picture></a>
 [![Coverage](https://coverage-badge.samuelcolvin.workers.dev/faststream-community/zMQTT.svg)](https://coverage-badge.samuelcolvin.workers.dev/redirect/faststream-community/zMQTT)
-[![License](https://img.shields.io/pypi/l/zmqtt.svg)](https://github.com/faststream-community/zMQTT/blob/master/LICENSE)
+
+[Docs](https://faststream-community.github.io/zMQTT) ·
+[PyPI](https://pypi.org/project/zmqtt) ·
+[Changelog](https://github.com/faststream-community/zMQTT/blob/master/CHANGELOG.md) ·
+[Contributing](https://github.com/faststream-community/zMQTT/blob/master/CHANGELOG.md) 
+
+</div>
 
 Pure asyncio MQTT 3.1.1 and 5.0 for Python 3.10+, with deterministic
 subscription routing, bounded queues, and correlation-safe request/response.
 
-[Documentation](https://faststream-community.github.io/zMQTT/) ·
-[PyPI](https://pypi.org/project/zmqtt/) ·
-[Changelog](https://github.com/faststream-community/zMQTT/blob/master/CHANGELOG.md)
+## What is MQTT?
+
+MQTT (Message Queuing Telemetry Transport) is a lightweight publish/subscribe
+messaging protocol designed for devices with limited resources and networks
+with low bandwidth or unstable connectivity. It became the de facto standard
+in the IoT world thanks to its minimal packet overhead: a fixed header takes
+as little as 2 bytes, which makes it cheap to send data even from small
+embedded devices over slow or unreliable networks.
+
+Official site: [mqtt.org](https://mqtt.org/)
 
 ## Why zmqtt?
 
@@ -251,8 +271,9 @@ async with create_client("localhost", version="5.0") as client:
     )
 ```
 
-MQTT 5 also adds session expiry, subscription identifiers, `no_local`, retain
-handling, publish properties, and a low-level AUTH packet API.
+MQTT 5 also adds session expiry, CONNECT properties such as receive limits,
+subscription identifiers, `no_local`, retain handling, publish properties, and
+a low-level AUTH packet API.
 
 ## Learn more
 

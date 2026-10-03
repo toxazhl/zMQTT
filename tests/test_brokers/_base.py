@@ -7,8 +7,11 @@ Run with:  pytest -m broker
 import abc
 import asyncio
 import contextlib
+import logging
+import ssl
 import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import FrozenInstanceError
 from typing import ClassVar, Literal
 
 import pytest
@@ -24,7 +27,12 @@ from zmqtt import (
     Subscription,
     Will,
     WillProperties,
+    create_client,
 )
+from zmqtt._internal.packets.publish import Publish
+from zmqtt._internal.protocol import MQTTProtocol
+from zmqtt._internal.transport.base import Transport
+from zmqtt._internal.transport.tcp import open_tcp
 
 
 @pytest.mark.broker
@@ -180,6 +188,52 @@ class BrokerTestBase(abc.ABC):
 
         message = await asyncio.wait_for(concrete.get_message(), timeout=5.0)
         assert message.payload == b"exact-remains"
+
+    async def test_stop_returns_broker_acknowledgement(self, mqtt_client: MQTTClient, topic: str) -> None:
+        sub = mqtt_client.subscribe(f"{topic}/a", f"{topic}/b")
+        await sub.start()
+
+        result = await sub.stop()
+
+        assert result is not None
+        assert result.topic_filters == (f"{topic}/a", f"{topic}/b")
+        assert result.reason_codes == ((0x00, 0x00) if self.version == "5.0" else ())
+        assert result.failures == {}
+
+    async def test_stop_after_disconnect_returns_none(self, mqtt_client: MQTTClient, topic: str) -> None:
+        sub = mqtt_client.subscribe(topic)
+        await sub.start()
+        await mqtt_client.disconnect()
+
+        result = await sub.stop()
+
+        assert result is None
+
+    async def test_repeated_stop_returns_none(self, mqtt_client: MQTTClient, topic: str) -> None:
+        sub = mqtt_client.subscribe(topic)
+        await sub.start()
+        await sub.stop()
+
+        result = await sub.stop()
+
+        assert result is None
+
+    async def test_stop_after_connection_loss_logs_failure(self, topic: str, caplog: pytest.LogCaptureFixture) -> None:
+        async with MQTTClient(
+            self.host,
+            self.port,
+            reconnect=ReconnectConfig(enabled=False),
+            version=self.version,
+        ) as client:
+            sub = client.subscribe(topic)
+            await sub.start()
+            await self.force_tcp_disconnect(client)
+
+            with caplog.at_level(logging.WARNING, logger="zmqtt.client"):
+                result = await sub.stop()
+
+        assert result is None
+        assert any(record.exc_info for record in caplog.records if record.name == "zmqtt.client")
 
     async def test_unsubscribe_identifier_preserves_other_subscription(
         self,
@@ -446,6 +500,145 @@ class BrokerTestBase(abc.ABC):
         await final_subscription.stop()
         await replayed_again.disconnect()
 
+    @pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
+    async def test_detach_preserves_unprocessed_messages_and_active_ack(
+        self,
+        topic: str,
+        qos: QoS,
+    ) -> None:
+        if not self.supports_persistent_sessions:
+            pytest.skip("Broker test configuration does not retain persistent sessions")
+        client_id = f"zmqtt-detach-{uuid.uuid4().hex[:8]}"
+        original = self.persistent_client(client_id=client_id)
+        await original.connect()
+        subscription = original.subscribe(topic, qos=qos, auto_ack=False, receive_buffer_size=1)
+        await subscription.start()
+
+        async with MQTTClient(self.host, self.port, version=self.version) as publisher:
+            await publisher.publish(topic, b"active", qos=qos)
+            active = await asyncio.wait_for(subscription.get_message(), timeout=5.0)
+            await publisher.publish(topic, b"queued", qos=qos)
+            await publisher.publish(topic, b"blocked", qos=qos)
+            await subscription.detach()
+            await asyncio.wait_for(active.ack(), timeout=5.0)
+            await asyncio.wait_for(original.publish(f"{topic}/response", b"done", qos=QoS.AT_LEAST_ONCE), timeout=5.0)
+            await publisher.publish(topic, b"after-detach", qos=qos)
+            await original.disconnect()
+            await publisher.publish(topic, b"offline", qos=qos)
+
+        resumed = self.persistent_client(client_id=client_id)
+        await resumed.connect()
+        replay = resumed.subscribe(topic, qos=qos, auto_ack=False)
+        await replay.start()
+        received: set[bytes] = set()
+        for _ in range(4):
+            message = await asyncio.wait_for(replay.get_message(), timeout=5.0)
+            received.add(message.payload)
+            await message.ack()
+        assert received == {b"queued", b"blocked", b"after-detach", b"offline"}
+        await replay.stop()
+        await resumed.disconnect()
+
+    @pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
+    @pytest.mark.parametrize("auto_ack", [False, True])
+    async def test_detach_preserves_messages_across_automatic_reconnect(
+        self,
+        topic: str,
+        qos: QoS,
+        auto_ack: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if not self.supports_persistent_sessions:
+            pytest.skip("Broker test configuration does not retain persistent sessions")
+        received: asyncio.Queue[bytes] = asyncio.Queue()
+        handle_publish = MQTTProtocol._handle_publish
+
+        async def observe_publish(protocol: MQTTProtocol, packet: Publish) -> None:
+            await handle_publish(protocol, packet)
+            if packet.topic == topic:
+                received.put_nowait(packet.payload)
+
+        monkeypatch.setattr(MQTTProtocol, "_handle_publish", observe_publish)
+        client = MQTTClient(
+            self.host,
+            self.port,
+            client_id=f"zmqtt-detach-reconnect-{uuid.uuid4().hex[:8]}",
+            clean_session=False,
+            version=self.version,
+            session_expiry_interval=60 if self.version == "5.0" else 0,
+            session_replay_timeout=0.05,
+            reconnect=ReconnectConfig(initial_delay=0.01),
+        )
+        async with client, MQTTClient(self.host, self.port, version=self.version) as publisher:
+            subscription = client.subscribe(
+                f"{topic}/#",
+                qos=qos,
+                auto_ack=auto_ack,
+                subscription_identifier=7 if self.version == "5.0" else None,
+            )
+            await subscription.start()
+            await subscription.detach()
+            await self.force_tcp_disconnect(client)
+
+            async def wait_for_reconnect() -> None:
+                while client._connection_info is None or client._connection_info.connection_id < 2:  # noqa: ASYNC110
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(wait_for_reconnect(), timeout=5.0)
+            assert client.connection_info.session_present
+            await publisher.publish(topic, b"first", qos=qos)
+            assert await asyncio.wait_for(received.get(), timeout=5.0) == b"first"
+            # Exercise delivery after the unmatched-session replay grace period.
+            await asyncio.sleep(0.15)
+            await publisher.publish(topic, b"second", qos=qos)
+            # Some brokers wait for first's ACK before sending second. A later
+            # resume still has to deliver both, whichever in-flight window is used.
+            await client.ping()
+            await asyncio.sleep(0.15)
+            await client.disconnect()
+            await publisher.publish(topic, b"offline", qos=qos)
+
+            # Reusing the same client proves explicit disconnect clears the guard.
+            await client.connect()
+            async with client.subscribe(f"{topic}/#", qos=qos, auto_ack=False) as replay:
+                payloads = set()
+                for _ in range(3):
+                    message = await asyncio.wait_for(replay.get_message(), timeout=5.0)
+                    payloads.add(message.payload)
+                    await message.ack()
+                assert payloads == {b"first", b"second", b"offline"}
+
+    async def test_stop_after_disconnect_allows_restart(self, topic: str) -> None:
+        async with MQTTClient(self.host, self.port, version=self.version) as client:
+            subscription = client.subscribe(topic)
+            await subscription.start()
+            await client.disconnect()
+            await subscription.stop()
+            await client.connect()
+            await subscription.start()
+            await client.publish(topic, b"restarted")
+            message = await asyncio.wait_for(subscription.get_message(), timeout=5.0)
+            assert message.payload == b"restarted"
+            await subscription.stop()
+
+    async def test_subscribe_to_detached_filter_warns(
+        self,
+        topic: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        async with MQTTClient(self.host, self.port, version=self.version) as client:
+            subscription = client.subscribe(topic)
+            await subscription.start()
+            await subscription.detach()
+            with pytest.raises(RuntimeError, match="cannot be restarted"):
+                await subscription.start()
+            replacement = client.subscribe(topic)
+            with caplog.at_level(logging.WARNING, logger="zmqtt.protocol"):
+                await replacement.start()
+            assert f"Filter {topic!r} is detached" in caplog.text
+            assert "Disconnect and connect the client" in caplog.text
+            await replacement.stop()
+
     async def test_persistent_session_replay_respects_subscription_buffer(
         self,
         topic: str,
@@ -532,6 +725,8 @@ class BrokerTestBase(abc.ABC):
 
             with pytest.raises(MQTTDisconnectedError):
                 await asyncio.wait_for(message_task, timeout=5.0)
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
 
     async def test_on_connection_recovery_failed_called(self) -> None:
         callback_calls = 0
@@ -539,6 +734,8 @@ class BrokerTestBase(abc.ABC):
         async def on_connection_recovery_failed() -> None:
             nonlocal callback_calls
             callback_calls += 1
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
 
         client = MQTTClient(
             self.host,
@@ -676,18 +873,167 @@ class BrokerTestBase(abc.ABC):
         assert msg.payload == b"ack-twice"
 
     async def test_manual_connect_disconnect(self) -> None:
+        client_id = f"zmqtt-manual-{uuid.uuid4().hex[:8]}"
+        client = create_client(
+            self.host,
+            self.port,
+            client_id=client_id,
+            version=self.version,
+        )
+        with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+            _ = client.connection_info
+        for connection_id in (1, 2):
+            await client.connect()
+            info = client.connection_info
+            assert info.connection_id == connection_id
+            assert info.return_code == 0
+            assert not info.session_present
+            assert info.effective_client_id == client_id
+            assert info.effective_keepalive == 60
+            assert info.effective_session_expiry_interval == (0 if self.version == "5.0" else None)
+            if self.version == "3.1.1":
+                assert info.properties is None
+            with pytest.raises(FrozenInstanceError):
+                info.connection_id = 100  # type: ignore[misc]
+            with pytest.raises(AttributeError):
+                client.connection_info = info  # type: ignore[misc]
+            rtt = await client.ping()
+            assert rtt >= 0
+            await client.disconnect()
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
+            assert info.connection_id == connection_id
+
+    async def test_connection_info_reconnect_after_failed_attempt(self, topic: str) -> None:
+        attempts = 0
+        retry_entered = asyncio.Event()
+        allow_retry = asyncio.Event()
+        client_id = f"zmqtt-info-{uuid.uuid4().hex[:8]}"
+
+        async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+            nonlocal attempts
+            attempts += 1
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
+            if attempts == 2:
+                retry_entered.set()
+                await allow_retry.wait()
+                msg = "temporary connection failure"
+                raise OSError(msg)
+            return await open_tcp(host, port)
+
         client = MQTTClient(
             self.host,
             self.port,
-            client_id=f"zmqtt-manual-{uuid.uuid4().hex[:8]}",
             version=self.version,
+            client_id=client_id,
+            transport_factory=factory,
+            reconnect=ReconnectConfig(initial_delay=0, max_attempts=2),
         )
-        await client.connect()
-        try:
-            rtt = await client.ping()
-            assert rtt >= 0
-        finally:
-            await client.disconnect()
+        async with client, client.subscribe(topic) as subscription:
+            old = client.connection_info
+            await self.force_tcp_disconnect(client)
+            await asyncio.wait_for(retry_entered.wait(), timeout=5)
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
+            allow_retry.set()
+
+            # A delivered message proves both handshake and subscription recovery.
+            async with MQTTClient(self.host, self.port, version=self.version) as publisher:
+                for _ in range(50):
+                    await publisher.publish(topic, b"reconnected")
+                    try:
+                        message = await asyncio.wait_for(subscription.get_message(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        continue
+                    break
+                else:
+                    pytest.fail("Subscription did not recover within 5 s")
+            assert message.payload == b"reconnected"
+            new = client.connection_info
+            assert new.connection_id == 2
+            assert new is not old
+            assert old.connection_id == 1
+            assert new.effective_client_id == old.effective_client_id == client_id
+            assert attempts == 3
+
+    async def test_connect_properties_are_accepted(self, topic: str) -> None:
+        if self.version != "5.0":
+            pytest.skip("CONNECT properties require MQTT 5.0")
+        async with (
+            create_client(
+                self.host,
+                self.port,
+                version="5.0",
+                receive_maximum=10,
+                maximum_packet_size=4096,
+                user_properties=(("zmqtt", "first"), ("zmqtt", "second")),
+                request_response_information=True,
+                request_problem_information=False,
+            ) as client,
+            client.subscribe(topic, qos=QoS.AT_LEAST_ONCE) as sub,
+        ):
+            await client.publish(topic, b"accepted", qos=QoS.AT_LEAST_ONCE)
+            msg = await asyncio.wait_for(sub.get_message(), timeout=5.0)
+
+        assert msg.payload == b"accepted"
+
+    async def test_receive_maximum_holds_deliveries_until_ack(self, topic: str) -> None:
+        if self.version != "5.0":
+            pytest.skip("Receive Maximum requires MQTT 5.0")
+        async with (
+            MQTTClient(self.host, self.port, version=self.version, receive_maximum=1) as client,
+            client.subscribe(topic, qos=QoS.AT_LEAST_ONCE, auto_ack=False) as sub,
+            MQTTClient(self.host, self.port, version=self.version) as publisher,
+        ):
+            await publisher.publish(topic, b"first", qos=QoS.AT_LEAST_ONCE)
+            await publisher.publish(topic, b"second", qos=QoS.AT_LEAST_ONCE)
+            first = await asyncio.wait_for(sub.get_message(), timeout=5.0)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(sub.get_message(), timeout=0.5)
+            await first.ack()
+            second = await asyncio.wait_for(sub.get_message(), timeout=5.0)
+            await second.ack()
+
+        assert {first.payload, second.payload} == {b"first", b"second"}
+
+    async def test_maximum_packet_size_applies_after_reconnect(self, topic: str) -> None:
+        if self.version != "5.0":
+            pytest.skip("Maximum Packet Size requires MQTT 5.0")
+        client = MQTTClient(
+            self.host,
+            self.port,
+            version=self.version,
+            maximum_packet_size=512,
+            reconnect=ReconnectConfig(initial_delay=0),
+        )
+        async with (
+            client,
+            client.subscribe(topic, qos=QoS.AT_LEAST_ONCE) as sub,
+            MQTTClient(self.host, self.port, version=self.version) as publisher,
+        ):
+
+            async def receive_only_small_messages() -> None:
+                # The broker must drop the oversized message; if it sent it, the
+                # client would disconnect and get_message() would raise.
+                await publisher.publish(topic, b"x" * 1024, qos=QoS.AT_LEAST_ONCE)
+                await publisher.publish(topic, b"small", qos=QoS.AT_LEAST_ONCE)
+                while (await asyncio.wait_for(sub.get_message(), timeout=5.0)).payload != b"small":
+                    pass
+
+            await receive_only_small_messages()
+            await self.force_tcp_disconnect(client)
+            for _ in range(50):
+                await publisher.publish(topic, b"probe")
+                try:
+                    await asyncio.wait_for(sub.get_message(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                break
+            else:
+                pytest.fail("Subscription did not recover within 5 s")
+            assert client.connection_info.connection_id == 2
+            await receive_only_small_messages()
 
     async def test_context_manager_manual_pub_sub(self, topic: str) -> None:
         async with MQTTClient(
@@ -926,7 +1272,7 @@ class BrokerTestBase(abc.ABC):
             )
             request = await asyncio.wait_for(req_sub.get_message(), timeout=5.0)
             assert request.properties is not None
-            await response_sub.stop()
+            result = await response_sub.stop()
             await responder.publish(
                 response_topic,
                 b"response-after-stop",
@@ -936,7 +1282,43 @@ class BrokerTestBase(abc.ABC):
             )
             reply = await request_task
 
+        assert result is None
         assert reply.payload == b"response-after-stop"
+
+    async def test_stop_reports_only_filters_sent_to_broker(self, topic: str) -> None:
+        if self.version != "5.0":
+            pytest.skip("request() requires MQTT 5.0")
+        response_topic = f"{topic}/responses"
+        other_filter = f"{topic}/other"
+        async with (
+            MQTTClient(self.host, self.port, version=self.version) as requester,
+            MQTTClient(self.host, self.port, version=self.version) as responder,
+            responder.subscribe(topic) as requests,
+        ):
+            response_sub = requester.subscribe(response_topic, other_filter)
+            await response_sub.start()
+            request_task = asyncio.create_task(
+                requester.request(
+                    topic,
+                    b"request",
+                    properties=PublishProperties(response_topic=response_topic),
+                    timeout=5.0,
+                ),
+            )
+            request = await asyncio.wait_for(requests.get_message(), timeout=5.0)
+            assert request.properties is not None
+
+            result = await response_sub.stop()
+            await responder.publish(
+                response_topic,
+                b"reply",
+                properties=PublishProperties(correlation_data=request.properties.correlation_data),
+            )
+            reply = await request_task
+
+        assert result is not None
+        assert result.topic_filters == (other_filter,)
+        assert reply.payload == b"reply"
 
     async def test_request_backpressure_delays_publish(self, topic: str) -> None:
         if self.version != "5.0":

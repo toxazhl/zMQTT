@@ -12,14 +12,16 @@ from typing import Literal
 
 import pytest
 
-from zmqtt._internal.packets.codec import encode
+from zmqtt import MQTTClient
+from zmqtt._internal.packets.codec import AnyPacket, encode
 from zmqtt._internal.packets.connect import ConnAck, Connect
 from zmqtt._internal.packets.disconnect import Disconnect
 from zmqtt._internal.packets.properties import PublishProperties
-from zmqtt._internal.packets.publish import PubAck, Publish, PubRel
+from zmqtt._internal.packets.publish import PubAck, Publish, PubRec, PubRel
 from zmqtt._internal.packets.reader import PacketBuffer
-from zmqtt._internal.packets.subscribe import SubAck, Subscribe, SubscriptionRequest
+from zmqtt._internal.packets.subscribe import SubAck, Subscribe, SubscriptionRequest, UnsubAck
 from zmqtt._internal.protocol import (
+    _PUBLISH_REASON_NAMES,
     MQTTProtocol,
     _raise_on_rejected_filters,
 )
@@ -32,9 +34,12 @@ from zmqtt.errors import (
     MQTTConnectError,
     MQTTDisconnectedError,
     MQTTProtocolError,
+    MQTTPublishError,
     MQTTSubscribeError,
     MQTTTimeoutError,
 )
+
+PUBLISH_FAILURE_CODES = [code for code in _PUBLISH_REASON_NAMES if code >= 0x80]
 
 
 class FakeTransport:
@@ -535,6 +540,31 @@ async def test_suback_failure_rolls_back_subscription_index() -> None:
     assert protocol._state.subscriptions.by_identifier(7) == []
 
 
+async def _answer_after(transport: FakeTransport, *, sent: int, packet: AnyPacket) -> None:
+    while len(transport.sent) < sent:  # noqa: ASYNC110
+        await asyncio.sleep(0)
+    transport.feed(encode(packet, version="5.0"))
+
+
+async def test_failed_observer_resubscribe_keeps_unsuback(caplog: pytest.LogCaptureFixture) -> None:
+    protocol, transport = make_protocol(version="5.0")
+    protocol._state.subscriptions.add_many({f: SubscriptionEntry(queue=asyncio.Queue()) for f in ("reply", "events/#")})
+    protocol._state.subscriptions.add_response_observer("reply")
+    read = await _run_read_loop(protocol)
+
+    with caplog.at_level(logging.WARNING, logger="zmqtt.protocol"):
+        unsubscribing = asyncio.create_task(protocol.unsubscribe(["reply", "events/#"]))
+        await _answer_after(transport, sent=1, packet=UnsubAck(packet_id=1, reason_codes=(0x00,)))
+        await _answer_after(transport, sent=2, packet=SubAck(packet_id=1, return_codes=(0x87,)))
+        acknowledged = await unsubscribing
+    await _stop_task(read)
+
+    assert acknowledged is not None
+    assert acknowledged[0] == ("events/#",)
+    assert acknowledged[1].reason_codes == (0x00,)
+    assert any(record.exc_info and "reply" in record.getMessage() for record in caplog.records)
+
+
 async def test_inbound_qos2_manual_ack_duplicate_ignored() -> None:
     """Broker retransmit before app calls ack() must not re-queue the message."""
     protocol, transport = make_protocol()
@@ -590,4 +620,82 @@ async def test_inbound_qos2_manual_ack_duplicate_ignored() -> None:
 
     assert queue.empty()
 
+    await _stop_task(read_task)
+
+
+@pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
+@pytest.mark.parametrize("auto_ack", [False, True])
+async def test_detached_subscription_does_not_ack_new_publish(qos: QoS, auto_ack: bool) -> None:
+    protocol, transport = make_protocol()
+    transport.feed(encode(ConnAck(session_present=False, return_code=0), version="3.1.1"))
+    await protocol.connect(Connect(client_id="c", clean_session=True, keepalive=60))
+    entry = SubscriptionEntry(queue=asyncio.Queue(), actual_filter="t/#", auto_ack=auto_ack)
+    protocol._state.subscriptions.add("t/#", entry)
+    protocol.detach(["t/#"])
+    transport.sent.clear()
+
+    await protocol._handle_publish(
+        Publish(topic="t/x", payload=b"unprocessed", qos=qos, retain=False, dup=False, packet_id=1),
+    )
+
+    assert entry.queue.empty()
+    assert transport.sent == []
+    assert protocol._state.subscriptions.contains("t/#")
+
+
+@pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
+async def test_detach_unblocks_full_subscription_queue_without_ack(qos: QoS) -> None:
+    protocol, transport = make_protocol()
+    transport.feed(encode(ConnAck(session_present=False, return_code=0), version="3.1.1"))
+    await protocol.connect(Connect(client_id="c", clean_session=True, keepalive=60))
+    transport.sent.clear()
+    client = MQTTClient("localhost")
+    client._protocol = protocol
+    subscription = client.subscribe("t/#", qos=qos, auto_ack=False, receive_buffer_size=1)
+    client._subscriptions.append(subscription)
+    subscription._registered_filters = ["t/#"]
+    entry = SubscriptionEntry(queue=subscription._queue, actual_filter="t/#", auto_ack=False)
+    protocol._state.subscriptions.add("t/#", entry)
+
+    def publish(packet_id: int) -> Publish:
+        return Publish(topic="t/x", payload=b"unprocessed", qos=qos, retain=False, dup=False, packet_id=packet_id)
+
+    await protocol._handle_publish(publish(1))
+    blocked_delivery = asyncio.create_task(protocol._handle_publish(publish(2)))
+    await asyncio.sleep(0)
+    assert not blocked_delivery.done()
+
+    await subscription.detach()
+    await asyncio.wait_for(blocked_delivery, timeout=1.0)
+
+    assert entry.queue.empty()
+    assert transport.sent == []
+
+
+@pytest.mark.parametrize("reason_code", PUBLISH_FAILURE_CODES)
+async def test_publish_qos2_rejected_pubrec_raises_no_pubrel_and_releases_packet_id(reason_code: int) -> None:
+    """publish() raises MQTTPublishError on a rejected PUBREC, sends no PUBREL, and frees the packet_id."""
+    protocol, transport = make_protocol(version="5.0")
+    transport.feed(encode(ConnAck(session_present=False, return_code=0), version="5.0"))
+    await protocol.connect(Connect(client_id="c", clean_session=True, keepalive=60))
+    transport.sent.clear()
+    read_task = await _run_read_loop(protocol)
+    publish_task = asyncio.create_task(
+        protocol.publish(
+            Publish(topic="t/x", payload=b"payload", qos=QoS.EXACTLY_ONCE, retain=False, dup=False, packet_id=0),
+        ),
+    )
+    await asyncio.sleep(0)
+    pid = next(iter(protocol._state.inflight_qos2_out))
+    sent_before_ack = len(transport.sent)
+
+    transport.feed(encode(PubRec(packet_id=pid, reason_code=reason_code), version="5.0"))
+    with pytest.raises(MQTTPublishError) as exc_info:
+        await publish_task
+
+    assert exc_info.value.reason_code == reason_code
+    assert exc_info.value.reason_name == _PUBLISH_REASON_NAMES[reason_code]
+    assert pid not in protocol._state.inflight_qos2_out
+    assert len(transport.sent) == sent_before_ack  # no PUBREL sent
+    assert protocol._state.packet_ids.acquire() == pid  # proves release: id is reused
     await _stop_task(read_task)

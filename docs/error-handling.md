@@ -9,6 +9,7 @@ MQTTError
   ├── MQTTDisconnectedError # connection lost unexpectedly
   ├── MQTTTimeoutError      # PINGRESP or CONNACK timed out
   ├── MQTTSubscribeError    # one or more filters rejected by the broker
+  ├── MQTTPublishError      # QoS 1/2 publish rejected by the broker
   └── MQTTInvalidTopicError # topic string failed MQTT validation
 ```
 
@@ -22,6 +23,7 @@ from zmqtt import (
     MQTTDisconnectedError,
     MQTTTimeoutError,
     MQTTSubscribeError,
+    MQTTPublishError,
     MQTTInvalidTopicError,
 )
 ```
@@ -41,6 +43,26 @@ try:
 except MQTTConnectError as e:
     print(f"Broker refused connection: code {e.return_code}")
 ```
+
+For MQTT 5.0, `e.properties` contains the received `ConnAckProperties`.
+Convenience attributes expose the broker's diagnostics:
+
+```python
+try:
+    async with create_client("localhost", version="5.0") as client:
+        ...
+except MQTTConnectError as e:
+    print(e.return_code, e.reason_string, e.server_reference)
+    for key, value in e.user_properties:
+        print(key, value)
+```
+
+Without properties (including MQTT 3.1.1), `properties`, `reason_string`, and
+`server_reference` are `None`, and `user_properties` is `()`. Repeated User
+Properties preserve their original order. The positional constructor
+`MQTTConnectError(return_code)` and exception text remain unchanged; properties
+can also be supplied with the optional keyword argument `properties=...`.
+A refused connection does not publish `client.connection_info`.
 
 Common return codes (MQTT 3.1.1):
 
@@ -69,9 +91,46 @@ except MQTTSubscribeError as e:
 
 The same exception is raised by `await sub.start()` when using the manual subscription lifecycle.
 
+A rejected UNSUBSCRIBE is not an exception — see [Manual subscription lifecycle](subscribing.md#manual-subscription-lifecycle).
+
+### `MQTTPublishError`
+
+Raised on a `version="5.0"` connection when the broker rejects a QoS 1 or QoS 2
+`publish()` — a PUBACK or PUBREC reason code of `0x80` or greater. A common
+cause is an authorization denial. The `reason_code` attribute holds the numeric
+code, `reason_name` the spec's name for it (`None` for a code zmqtt doesn't
+recognize), and `reason_string` the broker's optional Reason String property:
+
+```python
+from zmqtt import MQTTPublishError, QoS
+
+try:
+    await client.publish("private/topic", b"payload", qos=QoS.AT_LEAST_ONCE)
+except MQTTPublishError as e:
+    print(f"Publish rejected: 0x{e.reason_code:02X} ({e.reason_name})")
+```
+
+For QoS 2, a rejected PUBREC ends the handshake immediately — no PUBREL is
+sent, since MQTT 5.0 only permits PUBREL after a PUBREC reason code below
+`0x80`. In both cases the packet identifier is released and the connection
+remains usable for further operations.
+
+Not raised for QoS 0, and not raised at all on `version="3.1.1"` connections —
+PUBACK and PUBREC carry no reason code in that protocol version, so a rejected
+publish there completes without error unless the broker instead closes the
+connection.
+
+See [PUBACK and PUBREC reason codes](advanced/mqtt5.md#puback-and-pubrec-reason-codes)
+for more detail.
+
 ### `MQTTProtocolError`
 
 Raised when the broker sends a packet that violates the MQTT spec — wrong packet type in context, malformed header, etc. This usually indicates a broker bug or a mismatch between library version and broker behaviour.
+
+On MQTT 5.0 it is also raised when the broker exceeds the client's
+[`receive_maximum` or `maximum_packet_size`](advanced/mqtt5.md#connect-properties).
+The client sends DISCONNECT with the matching reason code and stops without
+reconnecting.
 
 ### `MQTTDisconnectedError`
 

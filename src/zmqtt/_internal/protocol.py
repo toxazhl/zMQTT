@@ -8,9 +8,10 @@ from collections.abc import AsyncGenerator, Iterable
 from typing import Final, Literal
 
 from zmqtt._internal import topic_matching
+from zmqtt._internal._compat import wait_for
 from zmqtt._internal.inbound import InboundPublishFlow
 from zmqtt._internal.packets.auth import Auth
-from zmqtt._internal.packets.codec import AnyPacket, encode
+from zmqtt._internal.packets.codec import AnyPacket, PacketTooLargeError, encode
 from zmqtt._internal.packets.connect import ConnAck, Connect
 from zmqtt._internal.packets.disconnect import Disconnect
 from zmqtt._internal.packets.ping import PingReq, PingResp
@@ -39,11 +40,38 @@ from zmqtt.errors import (
     MQTTConnectError,
     MQTTDisconnectedError,
     MQTTProtocolError,
+    MQTTPublishError,
+    MQTTQoSExceededError,
     MQTTSubscribeError,
     MQTTTimeoutError,
 )
 
 log = logging.getLogger("zmqtt.protocol")
+
+# see: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901124
+_PUBLISH_REASON_NAMES: Final[dict[int, str]] = {
+    0x00: "Success",
+    0x10: "No matching subscribers",
+    0x80: "Unspecified error",
+    0x83: "Implementation specific error",
+    0x87: "Not authorized",
+    0x90: "Topic Name invalid",
+    0x91: "Packet Identifier in use",
+    0x97: "Quota exceeded",
+    0x99: "Payload format invalid",
+}
+
+# MQTT 5.0 §3.11.3
+_UNSUBACK_REASON_NAMES: Final[dict[int, str]] = {
+    0x80: "Unspecified error",
+    0x83: "Implementation specific error",
+    0x87: "Not authorized",
+    0x8F: "Topic Filter invalid",
+    0x91: "Packet Identifier in use",
+}
+
+# MQTT 5.0 §3.1.2.11.4: DISCONNECT reason code for a packet above the client's Maximum Packet Size.
+_PACKET_TOO_LARGE: Final = 0x95
 
 
 class _SubscriptionGuard:
@@ -95,6 +123,41 @@ def _raise_on_rejected_filters(filters: list[SubscriptionRequest], suback: SubAc
         raise MQTTSubscribeError(failures)
 
 
+def _warn_on_rejected_unsubscribe(filters: list[str], unsuback: UnsubAck) -> None:
+    rejected = [
+        f"{f!r} (0x{code:02X} {_UNSUBACK_REASON_NAMES.get(code, 'Unknown')})"
+        for f, code in zip(filters, unsuback.reason_codes, strict=False)
+        if code >= 0x80
+    ]
+    if not rejected:
+        return
+    reason_string = unsuback.properties.reason_string if unsuback.properties is not None else None
+    log.warning(
+        "Broker rejected unsubscribe of %s%s; it may keep delivering messages on these filters",
+        ", ".join(rejected),
+        f" ({reason_string})" if reason_string else "",
+    )
+
+
+def _publish_error(packet: PubAck | PubRec) -> MQTTPublishError:
+    return MQTTPublishError(
+        packet.reason_code,
+        _PUBLISH_REASON_NAMES.get(packet.reason_code),
+        packet.properties.reason_string if packet.properties is not None else None,
+    )
+
+
+def _raise_on_rejected_puback(puback: PubAck) -> None:
+    """Surface PUBACK failure codes (>= 0x80) instead of ignoring them.
+
+    A rejected publish otherwise looks exactly like a successful publish.
+    """
+    if puback.reason_code >= 0x80:
+        err = _publish_error(puback)
+        log.debug("QoS 1 ack received with error for packet_id=%d: %s", puback.packet_id, err)
+        raise err
+
+
 class MQTTProtocol:
     """MQTT protocol engine.
 
@@ -118,6 +181,9 @@ class MQTTProtocol:
         request_router: RequestRouter | None = None,
         session_replay_buffer_size: int = 1000,
         session_replay_timeout: float = 30.0,
+        # Inbound limits to enforce; must match those advertised in CONNECT.
+        receive_maximum: int | None = None,
+        maximum_packet_size: int | None = None,
     ) -> None:
         self._transport = transport
         self._state = state
@@ -132,12 +198,17 @@ class MQTTProtocol:
             request_router=request_router,
             session_replay_buffer_size=session_replay_buffer_size,
             session_replay_timeout=session_replay_timeout,
+            receive_maximum=receive_maximum,
         )
-        self._buf = PacketBuffer(version=version)
+        self._buf = PacketBuffer(version=version, max_packet_size=maximum_packet_size)
         self._ping_waiters: list[asyncio.Future[None]] = []
         self._subscription_guards = _SubscriptionGuards()
         self._disconnecting = False
         self._dead = False
+        # MQTT 5 §3.2.2.3.4: absent Maximum QoS means the server accepts QoS 2,
+        # and 3.1.1 has no CONNACK properties at all — default to EXACTLY_ONCE
+        # so publish() never has to branch on None.
+        self._max_publish_qos: QoS = QoS.EXACTLY_ONCE
         self.started_event = asyncio.Event()
 
     async def connect(self, packet: Connect) -> ConnAck:
@@ -152,24 +223,41 @@ class MQTTProtocol:
         try:
             # No asyncio.shield (unlike ping): on timeout the transport is closed and
             # replaced by _connect_with_retry, so keeping the read coroutine alive is pointless.
-            return await asyncio.wait_for(self._await_connack(), timeout=self._connect_timeout)
+            return await wait_for(self._await_connack(), timeout=self._connect_timeout)
         except asyncio.TimeoutError as e:
             msg = "CONNACK not received within timeout"
             raise MQTTTimeoutError(msg) from e
 
     async def _await_connack(self) -> ConnAck:
-        while True:
-            data = await self._transport.read(4096)
-            self._buf.feed(data)
-            for pkt in self._buf:
-                if not isinstance(pkt, ConnAck):
-                    msg = f"Expected CONNACK, got {pkt!r}"
-                    raise MQTTProtocolError(msg)
-                if pkt.return_code != 0:
-                    raise MQTTConnectError(pkt.return_code)
-                log.info("Connected with session_present=%s", pkt.session_present)
-                self.inbound.begin_session(session_present=pkt.session_present)
-                return pkt
+        async with self._rejecting_oversized_packets():
+            while True:
+                data = await self._transport.read(4096)
+                self._buf.feed(data)
+                for pkt in self._buf:
+                    if not isinstance(pkt, ConnAck):
+                        msg = f"Expected CONNACK, got {pkt!r}"
+                        raise MQTTProtocolError(msg)
+                    if pkt.return_code != 0:
+                        raise MQTTConnectError(pkt.return_code, properties=pkt.properties)
+                    log.info("Connected with session_present=%s", pkt.session_present)
+                    if self._version == "5.0" and pkt.properties is not None:
+                        # Properties present but Maximum QoS absent: spec default is QoS 2.
+                        max_qos = pkt.properties.maximum_qos
+                        self._max_publish_qos = QoS.EXACTLY_ONCE if max_qos is None else QoS(max_qos)
+                    else:  # 3.1.1 has no CONNACK properties: no limit.
+                        self._max_publish_qos = QoS.EXACTLY_ONCE
+                    self.inbound.begin_session(session_present=pkt.session_present)
+                    return pkt
+
+    @contextlib.asynccontextmanager
+    async def _rejecting_oversized_packets(self) -> AsyncGenerator[None]:
+        """Close with DISCONNECT 0x95 when the broker exceeds our Maximum Packet Size."""
+        try:
+            yield
+        except PacketTooLargeError as e:
+            await self.abort(_PACKET_TOO_LARGE)
+            msg = f"Broker sent a packet of {e.size} bytes, exceeding the Maximum Packet Size of {e.limit} bytes"
+            raise MQTTProtocolError(msg) from e
 
     async def run(self) -> None:
         """Run read loop and ping loop concurrently until disconnection."""
@@ -234,6 +322,9 @@ class MQTTProtocol:
         Publish a message. Returns PubAck (QoS 1), PubComp (QoS 2), or None (QoS 0).
         """
         self._ensure_alive()
+        max_qos = self._max_publish_qos
+        if packet.qos > max_qos:
+            raise MQTTQoSExceededError(requested=int(packet.qos), maximum=int(max_qos))
         match packet.qos:
             case QoS.AT_MOST_ONCE:
                 await self._send(self._encode(packet))
@@ -252,7 +343,9 @@ class MQTTProtocol:
                 )
                 await self._send(self._encode(packet))
                 log.debug("Published QoS 1 to topic %r with packet_id=%d", packet.topic, pid)
-                return await future
+                ack = await future
+                _raise_on_rejected_puback(ack)
+                return ack
 
             case QoS.EXACTLY_ONCE:
                 loop = asyncio.get_running_loop()
@@ -314,7 +407,14 @@ class MQTTProtocol:
 
         for req in filters:
             f = req.topic_filter
-            if self._state.subscriptions.contains(f):
+            existing = self._state.subscriptions.get(f)
+            if existing is not None and existing.detached:
+                log.warning(
+                    "Filter %r is detached; the new subscription will not receive messages. "
+                    "Disconnect and connect the client before subscribing again.",
+                    f,
+                )
+            elif existing is not None:
                 log.warning("Filter %r already subscribed (ignored)", f)
             else:
                 new_entries[f] = SubscriptionEntry(
@@ -335,27 +435,49 @@ class MQTTProtocol:
                 for f in new_entries:
                     self._state.subscriptions.remove(f)
 
-    async def unsubscribe(self, filters: list[str]) -> UnsubAck | None:
+    async def unsubscribe(self, filters: list[str]) -> tuple[tuple[str, ...], UnsubAck] | None:
         """Remove queues and unsubscribe filters without response observers.
 
-        Returns ``None`` when every broker subscription must stay active for
-        request/response routing.
+        Returns the filters sent to the broker with its UNSUBACK, or ``None``
+        when every broker subscription must stay active for request/response
+        routing.
         """
         async with self._subscription_guards.hold(filters):
             return await self._unsubscribe(filters)
 
-    async def _unsubscribe(self, filters: list[str]) -> UnsubAck | None:
+    def detach(self, filters: list[str]) -> dict[str, SubscriptionEntry]:
+        """Keep broker filters while disabling their local delivery."""
+        detached: dict[str, SubscriptionEntry] = {}
+        for filter_ in filters:
+            entry = self._state.subscriptions.get(filter_)
+            if entry is not None:
+                entry.detached = True
+                detached[filter_] = entry
+        return detached
+
+    def restore_detached(self, entries: dict[str, SubscriptionEntry]) -> None:
+        """Restore local ACK suppression without sending SUBSCRIBE."""
+        self._state.subscriptions.add_many(entries)
+
+    async def _unsubscribe(self, filters: list[str]) -> tuple[tuple[str, ...], UnsubAck] | None:
         self._ensure_alive()
         observed_filters = [f for f in filters if self._state.subscriptions.has_response_observer(f)]
         broker_filters = [f for f in filters if f not in observed_filters]
         for f in filters:
             self._state.subscriptions.remove(f)
 
-        unsuback = await self._send_unsubscribe(broker_filters) if broker_filters else None
+        acknowledged = None
+        if broker_filters:
+            unsuback = await self._send_unsubscribe(broker_filters)
+            _warn_on_rejected_unsubscribe(broker_filters, unsuback)
+            acknowledged = (tuple(broker_filters), unsuback)
         if observed_filters:
             requests = [SubscriptionRequest(topic_filter=f, qos=QoS.AT_MOST_ONCE) for f in observed_filters]
-            await self._send_subscribe(requests, subscription_identifier=None)
-        return unsuback
+            try:
+                await self._send_subscribe(requests, subscription_identifier=None)
+            except Exception:  # noqa: BLE001 - must not discard the UNSUBACK already received
+                log.warning("Restoring response observers %s failed", observed_filters, exc_info=True)
+        return acknowledged
 
     async def add_response_observer(self, topic: str) -> None:
         """Keep an exact response topic subscribed for pending requests."""
@@ -387,7 +509,8 @@ class MQTTProtocol:
             return
         if self._state.subscriptions.contains(topic) or self._dead:
             return
-        await self._send_unsubscribe([topic])
+        unsuback = await self._send_unsubscribe([topic])
+        _warn_on_rejected_unsubscribe([topic], unsuback)
 
     async def _send_subscribe(
         self,
@@ -446,7 +569,7 @@ class MQTTProtocol:
         await self._send(self._encode(PingReq()))
         log.debug("Sent PINGREQ")
         try:
-            await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            await wait_for(asyncio.shield(future), timeout=timeout)
         except asyncio.TimeoutError as e:
             self._ping_waiters.remove(future)
             msg = "PINGRESP not received within timeout"
@@ -464,16 +587,17 @@ class MQTTProtocol:
         log.debug("Sent AUTH with reason_code=%d", packet.reason_code)
 
     async def _read_loop(self) -> None:
-        while True:
-            for packet in self._buf:
-                await self._dispatch(packet)
-            try:
-                data = await self._transport.read(4096)
-            except MQTTDisconnectedError:
-                if self._disconnecting:
-                    return
-                raise
-            self._buf.feed(data)
+        async with self._rejecting_oversized_packets():
+            while True:
+                for packet in self._buf:
+                    await self._dispatch(packet)
+                try:
+                    data = await self._transport.read(4096)
+                except MQTTDisconnectedError:
+                    if self._disconnecting:
+                        return
+                    raise
+                self._buf.feed(data)
 
     async def _ping_loop(self) -> None:
         while True:
@@ -531,7 +655,8 @@ class MQTTProtocol:
             msg = f"PUBACK for unknown packet_id {packet.packet_id}"
             raise MQTTProtocolError(msg)
         self._state.packet_ids.release(packet.packet_id)
-        flight.future.set_result(packet)
+        if not flight.future.done():
+            flight.future.set_result(packet)
         log.debug("QoS 1 ack received for packet_id=%d", packet.packet_id)
 
     async def _handle_pubrec(self, packet: PubRec) -> None:
@@ -544,6 +669,18 @@ class MQTTProtocol:
             raise MQTTProtocolError(
                 msg,
             )
+        # Unlike PUBACK/SUBACK, a negative PUBREC has no follow-up packet — MQTT 5
+        # terminates the QoS 2 flow here instead of sending PUBCOMP. The error must
+        # be raised from the handler because it also decides not to send PUBREL below.
+        if packet.reason_code >= 0x80:
+            self._state.inflight_qos2_out.pop(packet.packet_id, None)
+            self._state.packet_ids.release(packet.packet_id)
+            err = _publish_error(packet)
+            if not flight.future.done():
+                flight.future.set_exception(err)
+            log.debug("QoS 2 ack received with error for packet_id=%d: %s", packet.packet_id, err)
+            return
+
         flight.state = OutboundQoS2State.PENDING_PUBCOMP
         await self._send(self._encode(PubRel(packet_id=packet.packet_id)))
         log.debug("QoS 2 PUBREC received, sent PUBREL for packet_id=%d", packet.packet_id)
@@ -554,7 +691,8 @@ class MQTTProtocol:
             msg = f"PUBCOMP for unknown packet_id {packet.packet_id}"
             raise MQTTProtocolError(msg)
         self._state.packet_ids.release(packet.packet_id)
-        flight.future.set_result(packet)
+        if not flight.future.done():
+            flight.future.set_result(packet)
         log.debug("QoS 2 complete for packet_id=%d", packet.packet_id)
 
     async def _handle_suback(self, packet: SubAck) -> None:
@@ -587,8 +725,14 @@ class MQTTProtocol:
         """Send an encoded packet on behalf of an internal protocol flow."""
         await self._send(self._encode(packet))
 
-    async def abort(self) -> None:
-        """Close the transport after a terminal inbound-flow failure."""
+    async def abort(self, reason_code: int | None = None) -> None:
+        """Close the transport after a terminal failure.
+
+        On MQTT 5.0, *reason_code* is first sent in a best-effort DISCONNECT.
+        """
+        if reason_code is not None and self._version == "5.0":
+            with contextlib.suppress(Exception):
+                await self._send(self._encode(Disconnect(reason_code=reason_code)))
         await self._transport.close()
 
     async def _send(self, data: bytes) -> None:
