@@ -699,3 +699,126 @@ async def test_publish_qos2_rejected_pubrec_raises_no_pubrel_and_releases_packet
     assert len(transport.sent) == sent_before_ack  # no PUBREL sent
     assert protocol._state.packet_ids.acquire() == pid  # proves release: id is reused
     await _stop_task(read_task)
+
+
+# ---------------------------------------------------------------------------
+# Late acks for waiters that were cancelled
+#
+# A caller may be cancelled (HTTP client gone, timeout scope) after SUBSCRIBE /
+# UNSUBSCRIBE / PUBLISH went out but before the broker's ack came back.  The
+# ack still arrives — that is ordinary broker behaviour, not a protocol
+# violation — so it must neither kill the read loop nor be matched to a
+# different, newer request that happened to reuse the packet id.
+# ---------------------------------------------------------------------------
+
+
+async def _cancel(task: asyncio.Task[object]) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def _assert_read_loop_alive(read: asyncio.Task[None]) -> None:
+    for _ in range(20):
+        await asyncio.sleep(0)
+    if read.done():
+        pytest.fail(f"read loop died on a late ack: {read.exception()!r}")
+
+
+async def test_late_suback_after_cancelled_subscribe_keeps_connection() -> None:
+    protocol, transport = make_protocol()
+    read = await _run_read_loop(protocol)
+
+    task = asyncio.create_task(
+        protocol.subscribe(
+            [SubscriptionRequest(topic_filter="a/b", qos=QoS.AT_LEAST_ONCE)],
+            queue=asyncio.Queue(),
+        ),
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert transport.sent, "SUBSCRIBE must be on the wire before the cancel"
+    await _cancel(task)
+
+    transport.feed(encode(SubAck(packet_id=1, return_codes=(0x01,)), version="3.1.1"))
+    await _assert_read_loop_alive(read)
+    assert not protocol._state.subscriptions.contains("a/b")
+    assert 1 not in protocol._state.pending_subs
+    await _stop_task(read)
+
+
+async def test_cancelled_subscribe_holds_packet_id_until_suback() -> None:
+    """The id of an unanswered SUBSCRIBE is not reused: its late SUBACK would
+    otherwise resolve the newer request with the older one's verdict."""
+    protocol, transport = make_protocol()
+    read = await _run_read_loop(protocol)
+
+    old = asyncio.create_task(
+        protocol.subscribe(
+            [SubscriptionRequest(topic_filter="old/topic", qos=QoS.AT_LEAST_ONCE)],
+            queue=asyncio.Queue(),
+        ),
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await _cancel(old)
+
+    new = asyncio.create_task(
+        protocol.subscribe(
+            [SubscriptionRequest(topic_filter="new/topic", qos=QoS.AT_LEAST_ONCE)],
+            queue=asyncio.Queue(),
+        ),
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    buffer = PacketBuffer(version="3.1.1")
+    buffer.feed(transport.sent[-1])
+    (packet,) = list(buffer)
+    assert isinstance(packet, Subscribe)
+    assert packet.packet_id != 1
+
+    transport.feed(encode(SubAck(packet_id=1, return_codes=(0x80,)), version="3.1.1"))
+    transport.feed(
+        encode(SubAck(packet_id=packet.packet_id, return_codes=(0x01,)), version="3.1.1"),
+    )
+    await asyncio.wait_for(new, timeout=1)
+    await _assert_read_loop_alive(read)
+    assert protocol._state.subscriptions.contains("new/topic")
+    assert protocol._state.pending_subs == {}
+    await _stop_task(read)
+
+
+async def test_late_unsuback_after_cancelled_unsubscribe_keeps_connection() -> None:
+    protocol, transport = make_protocol()
+    read = await _run_read_loop(protocol)
+
+    task = asyncio.create_task(protocol.unsubscribe(["a/b"]))
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert transport.sent
+    await _cancel(task)
+
+    transport.feed(encode(UnsubAck(packet_id=1), version="3.1.1"))
+    await _assert_read_loop_alive(read)
+    assert protocol._state.pending_unsubs == {}
+    await _stop_task(read)
+
+
+async def test_late_puback_after_cancelled_publish_keeps_connection() -> None:
+    protocol, transport = make_protocol()
+    read = await _run_read_loop(protocol)
+
+    task = asyncio.create_task(
+        protocol.publish(
+            Publish(topic="a/b", payload=b"x", qos=QoS.AT_LEAST_ONCE, retain=False, dup=False),
+        ),
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert transport.sent
+    await _cancel(task)
+
+    transport.feed(encode(PubAck(packet_id=1), version="3.1.1"))
+    await _assert_read_loop_alive(read)
+    assert protocol._state.inflight_qos1 == {}
+    await _stop_task(read)
