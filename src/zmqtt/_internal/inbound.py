@@ -14,7 +14,7 @@ from zmqtt._internal.state import InboundQoS2Flight, InboundQoS2State, SessionSt
 from zmqtt._internal.subscription_index import SubscriptionSelection
 from zmqtt._internal.types.message import Message
 from zmqtt._internal.types.qos import QoS
-from zmqtt.errors import MQTTProtocolError
+from zmqtt.errors import MQTTLimitExceededError, MQTTProtocolError
 
 log = logging.getLogger("zmqtt.protocol")
 
@@ -137,7 +137,7 @@ class _PersistentReplayBuffered:
         if self._buffer_size and self._message_count >= self._buffer_size:
             msg = f"Persistent-session replay buffer limit of {self._buffer_size} messages exceeded"
             await self._connection.abort()
-            raise MQTTProtocolError(msg)
+            raise MQTTLimitExceededError(msg)
 
         self._publishes.append(publish)
         self._message_count += 1
@@ -503,7 +503,7 @@ class InboundPublishFlow:
         if limit is not None and len(self._unacknowledged) > limit:
             await self._connection.abort(_RECEIVE_MAXIMUM_EXCEEDED)
             msg = f"Broker exceeded the Receive Maximum of {limit} unacknowledged QoS 1/2 messages"
-            raise MQTTProtocolError(msg)
+            raise MQTTLimitExceededError(msg)
 
     async def _complete(self, ack: PubAck | PubComp) -> None:
         """Send the acknowledgement that ends an inbound QoS 1/2 flow."""

@@ -4,6 +4,8 @@
 
 Reconnection is enabled by default and applies to both the **initial connection** and any subsequent connection loss. When a network-level error (`OSError`) occurs, including during an established connection after an RST, route change, or VPN transition, the client waits and retries with exponential back-off. When a running connection drops (`MQTTDisconnectedError` or `MQTTTimeoutError`), it reconnects and re-subscribes automatically. Your `async for msg in sub` loop keeps waiting and resumes delivering messages once the connection is restored.
 
+A protocol violation by the broker on a running connection (`MQTTProtocolError`, e.g. an ack for an unknown packet id) closes that connection, as MQTT 5.0 §4.13 requires, and is then handled like a dropped connection: the client reconnects. The exception is a broker exceeding a limit this client set — Receive Maximum, Maximum Packet Size or the persistent-session replay buffer (`MQTTLimitExceededError`, a subclass): a new connection would be sent the same traffic, so the client stops instead.
+
 A broker refusal (`MQTTConnectError`, e.g. wrong credentials) is never retried — it propagates immediately regardless of `ReconnectConfig`.
 
 Your application code does not need to handle reconnection at all in the common case.

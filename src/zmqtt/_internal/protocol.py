@@ -40,6 +40,7 @@ from zmqtt._internal.types.qos import QoS
 from zmqtt.errors import (
     MQTTConnectError,
     MQTTDisconnectedError,
+    MQTTLimitExceededError,
     MQTTProtocolError,
     MQTTPublishError,
     MQTTQoSExceededError,
@@ -309,7 +310,7 @@ class MQTTProtocol:
         except PacketTooLargeError as e:
             await self.abort(_PACKET_TOO_LARGE)
             msg = f"Broker sent a packet of {e.size} bytes, exceeding the Maximum Packet Size of {e.limit} bytes"
-            raise MQTTProtocolError(msg) from e
+            raise MQTTLimitExceededError(msg) from e
 
     async def run(self) -> None:
         """Run read loop and ping loop concurrently until disconnection."""

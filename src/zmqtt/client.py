@@ -34,7 +34,13 @@ from zmqtt._internal.types.message import Message
 from zmqtt._internal.types.qos import QoS
 from zmqtt._internal.types.retain_handling import RetainHandling
 from zmqtt._internal.types.topic import validate_publish, validate_response_topic, validate_subscribe_topic
-from zmqtt.errors import MQTTConnectError, MQTTDisconnectedError, MQTTProtocolError, MQTTTimeoutError
+from zmqtt.errors import (
+    MQTTConnectError,
+    MQTTDisconnectedError,
+    MQTTLimitExceededError,
+    MQTTProtocolError,
+    MQTTTimeoutError,
+)
 
 __all__ = (
     "ConnectionInfo",
@@ -65,6 +71,20 @@ _MAX_PACKET_SIZE: Final = 268_435_460
 _MAX_STRING_BYTES: Final = 65_535
 
 log = logging.getLogger(__name__)
+
+
+def _raise_if_not_reconnectable(exc: Exception) -> None:
+    """Sort a lost connection: reconnect, or let the run loop end with *exc*.
+
+    A protocol violation ends the session (MQTT 5 §4.13: the connection is
+    closed), never the client, so it is rebuilt like any lost connection. A
+    broker exceeding a limit this client set is the exception: a new connection
+    would be sent the same traffic and fail the same way.
+    """
+    if isinstance(exc, MQTTLimitExceededError):
+        raise exc
+    if isinstance(exc, MQTTProtocolError):
+        log.error("Protocol error, dropping the connection: %s", exc)
 
 
 def _validate_user_properties(pairs: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
@@ -1138,10 +1158,7 @@ class MQTTClient:
 
             except (MQTTDisconnectedError, MQTTTimeoutError, MQTTProtocolError, OSError) as exc:
                 self._connection_info = None
-                # A protocol violation ends the session (MQTT 5 §4.13: the connection
-                # is closed), never the client: rebuild it like any lost connection.
-                if isinstance(exc, MQTTProtocolError):
-                    log.error("Protocol error, dropping the connection: %s", exc)  # noqa: TRY400
+                _raise_if_not_reconnectable(exc)
                 if not self._reconnect.enabled:
                     await self._notify_connection_recovery_failed()
                     raise

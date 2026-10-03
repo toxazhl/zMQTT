@@ -10,6 +10,7 @@ import pytest
 from zmqtt import (
     MQTTClient,
     MQTTDisconnectedError,
+    MQTTLimitExceededError,
     MQTTTimeoutError,
     QoS,
     ReconnectConfig,
@@ -62,6 +63,12 @@ def test_mqtt_v311_rejects_will_properties() -> None:
 
     with pytest.raises(RuntimeError, match=r"will properties require MQTT 5\.0"):
         MQTTClient("localhost", version="3.1.1", will=will)
+
+
+def _v5_publish(packet_id: int | None, payload: bytes = b"x") -> bytes:
+    qos = QoS.AT_MOST_ONCE if packet_id is None else QoS.AT_LEAST_ONCE
+    packet = Publish(topic="t", payload=payload, qos=qos, retain=False, dup=False, packet_id=packet_id)
+    return encode(packet, version="5.0")
 
 
 class FakeTransport:
@@ -384,3 +391,47 @@ async def test_protocol_error_reconnects_instead_of_killing_client() -> None:
         assert client._run_task is not None
         assert not client._run_task.done()
         assert client._protocol._transport is made[1]
+
+
+@pytest.mark.parametrize(
+    ("limits", "violation"),
+    [
+        pytest.param({"receive_maximum": 1}, b"".join(_v5_publish(pid) for pid in (1, 2)), id="receive_maximum"),
+        pytest.param({"maximum_packet_size": 64}, _v5_publish(None, payload=b"x" * 200), id="maximum_packet_size"),
+    ],
+)
+async def test_limit_violation_stays_terminal_despite_protocol_error_reconnect(
+    limits: dict[str, int],
+    violation: bytes,
+) -> None:
+    """The reconnect above must not swallow a broker exceeding OUR limits.
+
+    A new connection would be sent the same traffic, so upstream's contract
+    (stop with MQTTProtocolError, no reconnect) holds for every limit, not
+    only for the one its own test happens to cover.
+    """
+    made: list[FakeTransport] = []
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        transport = FakeTransport(feed=encode(ConnAck(session_present=False, return_code=0), version="5.0"))
+        made.append(transport)
+        return transport
+
+    client = MQTTClient(
+        "localhost",
+        version="5.0",
+        transport_factory=factory,
+        reconnect=ReconnectConfig(initial_delay=0),
+        **limits,  # type: ignore[arg-type]
+    )
+    async with client:
+        sub = client.subscribe("t", qos=QoS.AT_LEAST_ONCE, auto_ack=False)
+        client._subscriptions.append(sub)
+        assert client._protocol is not None
+        client._protocol._state.subscriptions.add("t", SubscriptionEntry(queue=sub._queue, auto_ack=False))
+        made[0]._rx.append(violation)
+        assert client._run_task is not None
+        with pytest.raises(MQTTLimitExceededError):
+            await asyncio.wait_for(asyncio.shield(client._run_task), timeout=2)
+
+    assert len(made) == 1

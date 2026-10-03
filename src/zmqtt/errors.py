@@ -21,6 +21,16 @@ class MQTTProtocolError(MQTTError):
     """Unexpected or malformed packet received."""
 
 
+class MQTTLimitExceededError(MQTTProtocolError):
+    """The broker exceeded a limit this client set: Receive Maximum (0x93),
+    Maximum Packet Size (0x95) or the persistent-session replay buffer.
+
+    Unlike other protocol errors it is terminal: a new connection would be sent
+    the same traffic and fail the same way, so the client stops instead of
+    reconnecting.
+    """
+
+
 class MQTTQoSExceededError(MQTTError):
     """A PUBLISH requested a QoS higher than the server's advertised Maximum QoS.
 
