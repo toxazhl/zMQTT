@@ -31,7 +31,7 @@ from zmqtt._internal.types.message import Message
 from zmqtt._internal.types.qos import QoS
 from zmqtt._internal.types.retain_handling import RetainHandling
 from zmqtt._internal.types.topic import validate_publish, validate_response_topic, validate_subscribe_topic
-from zmqtt.errors import MQTTConnectError, MQTTDisconnectedError, MQTTTimeoutError
+from zmqtt.errors import MQTTConnectError, MQTTDisconnectedError, MQTTProtocolError, MQTTTimeoutError
 
 __all__ = (
     "MQTTClient",
@@ -827,7 +827,11 @@ class MQTTClient:
                 await self._request_dispatcher.restore()
                 await protocol_run_task
 
-            except (MQTTDisconnectedError, MQTTTimeoutError):
+            except (MQTTDisconnectedError, MQTTTimeoutError, MQTTProtocolError) as exc:
+                # A protocol violation ends the session (MQTT 5 §4.13: the connection
+                # is closed), never the client: rebuild it like any lost connection.
+                if isinstance(exc, MQTTProtocolError):
+                    log.error("Protocol error, dropping the connection: %s", exc)  # noqa: TRY400
                 if not self._reconnect.enabled:
                     await self._notify_connection_recovery_failed()
                     raise

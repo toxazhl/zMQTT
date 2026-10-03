@@ -18,6 +18,7 @@ from zmqtt import (
 )
 from zmqtt._internal.packets.codec import encode
 from zmqtt._internal.packets.connect import ConnAck
+from zmqtt._internal.packets.subscribe import SubAck
 from zmqtt._internal.transport.base import Transport
 
 
@@ -177,3 +178,40 @@ async def test_reset_forces_reconnect_and_resubscribe() -> None:
         assert client._protocol._transport is made[1]  # and a fresh session took over
 
     await client.reset()  # after disconnect: a documented no-op, must not raise
+
+
+async def test_protocol_error_reconnects_instead_of_killing_client() -> None:
+    """A protocol violation ends the session, not the client.
+
+    MQTT 5 §4.13: on a protocol error the connection is closed — and a closed
+    connection is what the run loop exists to rebuild.  Before this, any
+    MQTTProtocolError escaped _run_loop: the client stayed dead for the life of
+    the process while every operation answered ``Connection lost``.
+    """
+    connack = encode(ConnAck(session_present=False, return_code=0), version="3.1.1")
+    stray = encode(SubAck(packet_id=9, return_codes=(0x00,)), version="3.1.1")
+    first = FakeTransport(feed=connack + stray)  # SUBACK nobody asked for
+    made: list[FakeTransport] = []
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        transport = first if not made else FakeTransport(feed=connack)
+        made.append(transport)
+        return transport
+
+    client = MQTTClient(
+        "localhost",
+        reconnect=ReconnectConfig(initial_delay=0.0, max_attempts=None),
+        transport_factory=factory,
+    )
+    async with client:
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(made) == 2 and client._protocol is not None:
+                break
+        else:
+            pytest.fail("run loop did not reconnect after a protocol error")
+
+        assert first.closed
+        assert client._run_task is not None
+        assert not client._run_task.done()
+        assert client._protocol._transport is made[1]

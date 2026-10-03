@@ -5,7 +5,7 @@ import contextlib
 import dataclasses
 import logging
 from collections.abc import AsyncGenerator, Iterable
-from typing import Final, Literal
+from typing import Final, Literal, TypeVar
 
 from zmqtt._internal import topic_matching
 from zmqtt._internal.inbound import InboundPublishFlow
@@ -28,6 +28,7 @@ from zmqtt._internal.routing import InboundRecipient, RequestRouter
 from zmqtt._internal.state import (
     OutboundQoS2Flight,
     OutboundQoS2State,
+    PacketIdPool,
     QoS1Flight,
     SessionState,
 )
@@ -93,6 +94,57 @@ def _raise_on_rejected_filters(filters: list[SubscriptionRequest], suback: SubAc
     failures = {req.topic_filter: code for req, code in zip(filters, suback.return_codes, strict=False) if code >= 0x80}
     if failures:
         raise MQTTSubscribeError(failures)
+
+
+_AckT = TypeVar("_AckT", SubAck, UnsubAck)
+
+
+def _settle_ack_waiter(
+    pending: dict[int, asyncio.Future[_AckT]],
+    packet_ids: PacketIdPool,
+    pid: int,
+    *,
+    attempted: bool,
+) -> None:
+    """Close out a SUBSCRIBE/UNSUBSCRIBE waiter when its caller returns or unwinds.
+
+    A caller cancelled after the request may have reached the wire leaves the
+    broker owing an ack for ``pid``.  The id stays reserved (entry kept, future
+    cancelled) until that ack arrives or the connection ends: releasing it now
+    would turn the ordinary late ack into an "unknown packet_id" protocol error,
+    or match it to a newer request that reused the id.
+    """
+    future = pending.get(pid)
+    answered = future is None or (future.done() and not future.cancelled())
+    if attempted and not answered:
+        assert future is not None  # noqa: S101 — narrowed by ``answered``
+        future.cancel()
+        return
+    pending.pop(pid, None)
+    packet_ids.release(pid)
+
+
+def _resolve_ack_waiter(
+    pending: dict[int, asyncio.Future[_AckT]],
+    packet_ids: PacketIdPool,
+    kind: str,
+    packet: _AckT,
+) -> None:
+    """Hand a SUBACK/UNSUBACK to its waiter; a late ack for an abandoned one retires its id."""
+    pid = packet.packet_id
+    future = pending.get(pid)
+    if future is None:
+        msg = f"{kind} for unknown packet_id {pid}"
+        raise MQTTProtocolError(msg)
+    if future.cancelled():
+        del pending[pid]
+        packet_ids.release(pid)
+        log.debug("Late %s for abandoned packet_id=%d retired", kind, pid)
+        return
+    if future.done():
+        msg = f"Duplicate {kind} for packet_id {pid}"
+        raise MQTTProtocolError(msg)
+    future.set_result(packet)
 
 
 class MQTTProtocol:
@@ -199,6 +251,12 @@ class MQTTProtocol:
     def _cancel_pending(self) -> None:  # noqa: C901
         """Fail all futures awaiting broker responses — called when run() exits."""
         exc = MQTTDisconnectedError("Connection lost")
+        # Abandoned requests (waiter cancelled, ack still owed) cannot be answered on
+        # a new connection: their ids go back to the pool here.
+        for pending in (self._state.pending_subs, self._state.pending_unsubs):
+            for pid in [pid for pid, f in pending.items() if f.cancelled()]:
+                del pending[pid]
+                self._state.packet_ids.release(pid)
         for sub_f in self._state.pending_subs.values():
             if not sub_f.done():
                 sub_f.set_exception(exc)
@@ -404,19 +462,19 @@ class MQTTProtocol:
             if subscription_identifier is not None
             else None
         )
+        attempted = False
         try:
-            await self._send(
-                self._encode(
-                    Subscribe(packet_id=pid, subscriptions=tuple(filters), properties=properties),
-                ),
+            packet = self._encode(
+                Subscribe(packet_id=pid, subscriptions=tuple(filters), properties=properties),
             )
+            attempted = True
+            await self._send(packet)
             log.debug("Sent SUBSCRIBE with packet_id=%d", pid)
             suback = await future
             _raise_on_rejected_filters(filters, suback)
             return suback
         finally:
-            self._state.pending_subs.pop(pid, None)
-            self._state.packet_ids.release(pid)
+            _settle_ack_waiter(self._state.pending_subs, self._state.packet_ids, pid, attempted=attempted)
 
     async def _send_unsubscribe(self, filters: list[str]) -> UnsubAck:
         self._ensure_alive()
@@ -424,18 +482,18 @@ class MQTTProtocol:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[UnsubAck] = loop.create_future()
         self._state.pending_unsubs[pid] = future
+        attempted = False
         try:
-            await self._send(
-                encode(
-                    Unsubscribe(packet_id=pid, topic_filters=tuple(filters)),
-                    version=self._version,
-                ),
+            packet = encode(
+                Unsubscribe(packet_id=pid, topic_filters=tuple(filters)),
+                version=self._version,
             )
+            attempted = True
+            await self._send(packet)
             log.debug("Sent UNSUBSCRIBE with packet_id=%d", pid)
             return await future
         finally:
-            self._state.pending_unsubs.pop(pid, None)
-            self._state.packet_ids.release(pid)
+            _settle_ack_waiter(self._state.pending_unsubs, self._state.packet_ids, pid, attempted=attempted)
 
     async def ping(self, timeout: float | None = None) -> float:
         """Send PINGREQ and return RTT in seconds when PINGRESP is received."""
@@ -531,7 +589,8 @@ class MQTTProtocol:
             msg = f"PUBACK for unknown packet_id {packet.packet_id}"
             raise MQTTProtocolError(msg)
         self._state.packet_ids.release(packet.packet_id)
-        flight.future.set_result(packet)
+        if not flight.future.done():  # the publisher may have been cancelled meanwhile
+            flight.future.set_result(packet)
         log.debug("QoS 1 ack received for packet_id=%d", packet.packet_id)
 
     async def _handle_pubrec(self, packet: PubRec) -> None:
@@ -554,24 +613,15 @@ class MQTTProtocol:
             msg = f"PUBCOMP for unknown packet_id {packet.packet_id}"
             raise MQTTProtocolError(msg)
         self._state.packet_ids.release(packet.packet_id)
-        flight.future.set_result(packet)
+        if not flight.future.done():  # the publisher may have been cancelled meanwhile
+            flight.future.set_result(packet)
         log.debug("QoS 2 complete for packet_id=%d", packet.packet_id)
 
     async def _handle_suback(self, packet: SubAck) -> None:
-        future = self._state.pending_subs.get(packet.packet_id)
-        if future is None:
-            msg = f"SUBACK for unknown packet_id {packet.packet_id}"
-            raise MQTTProtocolError(msg)
-        future.set_result(packet)
+        _resolve_ack_waiter(self._state.pending_subs, self._state.packet_ids, "SUBACK", packet)
 
     async def _handle_unsuback(self, packet: UnsubAck) -> None:
-        future = self._state.pending_unsubs.get(packet.packet_id)
-        if future is None:
-            msg = f"UNSUBACK for unknown packet_id {packet.packet_id}"
-            raise MQTTProtocolError(
-                msg,
-            )
-        future.set_result(packet)
+        _resolve_ack_waiter(self._state.pending_unsubs, self._state.packet_ids, "UNSUBACK", packet)
 
     def _handle_pingresp(self) -> None:
         if self._ping_waiters:
