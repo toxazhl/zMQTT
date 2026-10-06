@@ -3,6 +3,7 @@
 import asyncio
 import ssl
 from collections import deque
+from collections.abc import Callable
 from typing import Literal
 
 import pytest
@@ -435,3 +436,126 @@ async def test_limit_violation_stays_terminal_despite_protocol_error_reconnect(
             await asyncio.wait_for(asyncio.shield(client._run_task), timeout=2)
 
     assert len(made) == 1
+
+
+class _ClosedBeforeConnAckTransport(FakeTransport):
+    """A broker that accepts TCP, reads CONNECT and closes — EMQX mid-restart."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self._error = error
+
+    async def write(self, data: bytes) -> None:
+        await super().write(data)
+        if data[0] >> 4 == PacketType.CONNECT:
+            self._rx.append(self._error)
+
+
+_CLOSED_BY_REMOTE = pytest.param(lambda: MQTTDisconnectedError("Connection closed by remote"), id="closed_by_remote")
+_RESET_BY_PEER = pytest.param(lambda: MQTTDisconnectedError("Connection lost"), id="reset_by_peer")
+_NOT_A_CONNACK = pytest.param(None, id="ping_instead_of_connack")
+
+
+def _refusing_transport(make_error: Callable[[], Exception] | None) -> FakeTransport:
+    if make_error is None:  # a broker answering something other than CONNACK
+        return FakeTransport(feed=encode(PingResp(), version="3.1.1"))
+    return _ClosedBeforeConnAckTransport(make_error())
+
+
+@pytest.mark.parametrize("make_error", [_CLOSED_BY_REMOTE, _RESET_BY_PEER, _NOT_A_CONNACK])
+async def test_connect_retries_when_broker_closes_before_connack(
+    make_error: Callable[[], Exception] | None,
+) -> None:
+    connack = encode(ConnAck(session_present=False, return_code=0), version="3.1.1")
+    made: list[FakeTransport] = []
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        transport = _refusing_transport(make_error) if not made else FakeTransport(feed=connack)
+        made.append(transport)
+        return transport
+
+    client = MQTTClient(
+        "localhost",
+        reconnect=ReconnectConfig(initial_delay=0.0, max_attempts=None),
+        transport_factory=factory,
+    )
+
+    await client._connect_with_retry()
+
+    assert len(made) == 2  # the refused attempt was retried, not raised
+    assert made[0].closed
+    assert client._protocol is not None
+    assert client._protocol._transport is made[1]
+
+
+async def test_connect_gives_up_on_closed_by_remote_after_max_attempts() -> None:
+    made: list[FakeTransport] = []
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        transport = _ClosedBeforeConnAckTransport(MQTTDisconnectedError("Connection closed by remote"))
+        made.append(transport)
+        return transport
+
+    client = MQTTClient(
+        "localhost",
+        reconnect=ReconnectConfig(initial_delay=0.0, max_attempts=3),
+        transport_factory=factory,
+    )
+
+    with pytest.raises(MQTTDisconnectedError):
+        await client._connect_with_retry()
+
+    assert len(made) == 3  # max_attempts still bounds a transient fault
+    assert all(t.closed for t in made)
+
+
+async def test_run_loop_survives_broker_closing_during_its_reconnect() -> None:
+    """The dev incident: EMQX dropped the session, then closed the reconnect's
+    socket before CONNACK. That ended the run loop for good — every subscription
+    got ``Connection closed by remote`` as a terminal error — although the next
+    attempt would have connected."""
+    connack = encode(ConnAck(session_present=False, return_code=0), version="3.1.1")
+    first = FakeTransport(feed=connack)
+    closed_mid_reconnect = _ClosedBeforeConnAckTransport(MQTTDisconnectedError("Connection closed by remote"))
+    healthy = FakeTransport(feed=connack)
+    made: list[FakeTransport] = []
+    recovery_failed: list[bool] = []
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        transport = (first, closed_mid_reconnect, healthy)[len(made)]
+        made.append(transport)
+        return transport
+
+    async def on_recovery_failed() -> None:
+        recovery_failed.append(True)
+
+    client = MQTTClient(
+        "localhost",
+        reconnect=ReconnectConfig(initial_delay=0.0, max_attempts=None),
+        transport_factory=factory,
+        on_connection_recovery_failed=on_recovery_failed,
+    )
+
+    async with client:
+        sub = client.subscribe("t")
+        client._subscriptions.append(sub)
+        first._rx.append(MQTTDisconnectedError("Connection closed by remote"))
+
+        async def reconnected() -> None:
+            while True:
+                await asyncio.sleep(0)
+                info = client._connection_info
+                if info is not None and info.connection_id == 2:
+                    return
+
+        await asyncio.wait_for(reconnected(), timeout=2)
+
+        assert client._run_task is not None
+        assert not client._run_task.done()
+        assert client._subscription_failure is not None
+        assert not client._subscription_failure.done()  # no subscriber was told "stopped for good"
+        assert len(made) == 3
+        assert closed_mid_reconnect.closed
+        assert client._protocol is not None
+        assert client._protocol._transport is healthy
+        assert recovery_failed == []

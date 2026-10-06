@@ -1125,7 +1125,12 @@ class MQTTClient:
                 await self._connect()
             except MQTTConnectError:  # noqa: PERF203
                 raise
-            except (OSError, MQTTTimeoutError):
+            except (OSError, MQTTTimeoutError, MQTTDisconnectedError, MQTTProtocolError) as exc:
+                # A broker that accepts TCP and then closes (or answers garbage)
+                # before CONNACK is mid-restart or overloaded — the same transient
+                # fault as a refused socket, so it gets the same backoff. Only a
+                # CONNACK refusal and a limit violation end the attempt for good.
+                _raise_if_not_reconnectable(exc)
                 attempt += 1
                 max_a = self._reconnect.max_attempts
                 if not self._reconnect.enabled or (max_a is not None and attempt >= max_a):
@@ -1176,7 +1181,7 @@ class MQTTClient:
             log.warning("Connection lost, reconnecting...")
             try:
                 await self._connect_with_retry(wait_before_first_attempt=True)
-            except (MQTTConnectError, MQTTTimeoutError, OSError):
+            except (MQTTConnectError, MQTTTimeoutError, MQTTDisconnectedError, MQTTProtocolError, OSError):
                 await self._notify_connection_recovery_failed()
                 raise
             log.info("Successfully reconnected")
